@@ -1,0 +1,79 @@
+#
+# Local test setup serving Docmost under http://localhost:20867/docmost/
+#
+#   docker compose -f docker/docker-compose.yml up -d --build
+#
+# The image is built from this repository (not pulled) so that the local
+# subpath changes take effect. The client build bakes in the BASE_PATH
+# build argument. Do NOT set COLLAB_URL - the websocket is derived from
+# APP_URL and proxied through Caddy.
+---
+services:
+  docmost:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        # Baked into the client build; change together with the prefix in
+        # the Caddyfile. Keep the trailing slash.
+        BASE_PATH: ${BASE_PATH:-/docmost/}
+    image: docmost:dev
+    restart: unless-stopped
+    environment:
+      # No trailing slash: links are concatenated on it.
+      APP_URL: ${APP_URL:-http://localhost:20867/docmost}
+      APP_SECRET: ${APP_SECRET:-local-development-app-secret-change-me-0001}
+      DATABASE_URL: postgresql://docmost:${POSTGRES_PASSWORD:-docmost}@db:5432/docmost
+      REDIS_URL: redis://redis:6379
+    volumes:
+      - docmost_storage:/app/data/storage
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  db:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: docmost
+      POSTGRES_USER: docmost
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-docmost}
+    volumes:
+      - docmost_db_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docmost -d docmost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:8
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - docmost_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  proxy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      # Open http://localhost:20867/docmost/
+      - "20867:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - docmost
+
+volumes:
+  docmost_storage:
+  docmost_db_data:
+  docmost_redis_data:
+  caddy_data:

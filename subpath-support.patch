@@ -1,0 +1,958 @@
+diff --git a/.gitlab-ci.yml b/.gitlab-ci.yml
+new file mode 100644
+index 00000000..f17ec285
+--- /dev/null
++++ b/.gitlab-ci.yml
+@@ -0,0 +1,80 @@
++# SPDX-License-Identifier: MIT
++#
++# Pipeline for the /docmost subpath build.
++#
++# Required GitLab CI/CD variables (Settings -> CI/CD -> Variables):
++#   KUBE_CONFIG  kubeconfig of a service account that can manage the
++#                "docmost" namespace on the work cluster
++#   APP_URL      external URL incl. subpath, e.g. https://docs.example.com/docmost
++#
++# The GitLab built-in variables CI_REGISTRY / CI_REGISTRY_IMAGE /
++# CI_REGISTRY_USER / CI_REGISTRY_PASSWORD are used automatically.
++# Docker-in-Docker jobs require a runner with the "privileged" mode enabled.
++
++stages:
++  - build
++  - deploy
++
++variables:
++  BASE_PATH: "/docmost/"
++  DEPLOY_NAMESPACE: "docmost"
++  DOCKER_TLS_CERTDIR: ""
++  DOCKER_HOST: tcp://docker:2375
++  DOCKER_BUILDKIT: "1"
++
++# ---------------------------------------------------------------------------
++# Build the application image from this repository. Docmost is a single app
++# (NestJS server + built React client); the client build bakes in
++# BASE_PATH=${BASE_PATH}.
++# ---------------------------------------------------------------------------
++
++build:docmost:
++  stage: build
++  image: docker:27
++  services:
++    - docker:27-dind
++  rules:
++    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
++  before_script:
++    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
++  script:
++    - docker build
++      --build-arg BASE_PATH=$BASE_PATH
++      -f Dockerfile
++      -t "$CI_REGISTRY_IMAGE/docmost:$CI_COMMIT_SHA"
++      -t "$CI_REGISTRY_IMAGE/docmost:latest"
++      .
++    - docker push "$CI_REGISTRY_IMAGE/docmost:$CI_COMMIT_SHA"
++    - docker push "$CI_REGISTRY_IMAGE/docmost:latest"
++
++# ---------------------------------------------------------------------------
++# Deploy manifests and roll the new image out.
++# Manifests live in deploy/k8s (namespace, configmap, secret, postgres,
++# redis, docmost, caddy proxy, ingress).
++# ---------------------------------------------------------------------------
++
++deploy:production:
++  stage: deploy
++  image: bitnami/kubectl:1.31
++  dependencies: []
++  rules:
++    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
++  before_script:
++    - test -n "$KUBE_CONFIG" || (echo "KUBE_CONFIG variable is required" && exit 1)
++    - test -n "$APP_URL" || (echo "APP_URL variable is required" && exit 1)
++    - mkdir -p "$HOME/.kube"
++    - echo "$KUBE_CONFIG" > "$HOME/.kube/config"
++  script:
++    - kubectl apply -f deploy/k8s
++    # Point the application to the real external URL (checked-in default is
++    # the local minikube URL). Other ConfigMap keys stay untouched.
++    - kubectl -n "$DEPLOY_NAMESPACE" patch configmap docmost-env --type merge
++      -p "{\"data\":{\"APP_URL\":\"$APP_URL\"}}"
++    # Roll out the freshly built image.
++    - kubectl -n "$DEPLOY_NAMESPACE" set image deployment/docmost
++      docmost="$CI_REGISTRY_IMAGE/docmost:$CI_COMMIT_SHA"
++    - kubectl -n "$DEPLOY_NAMESPACE" rollout status deployment/db --timeout=180s
++    - kubectl -n "$DEPLOY_NAMESPACE" rollout status deployment/redis --timeout=180s
++    - kubectl -n "$DEPLOY_NAMESPACE" rollout status deployment/docmost --timeout=300s
++    - kubectl -n "$DEPLOY_NAMESPACE" rollout restart deployment/proxy
++    - kubectl -n "$DEPLOY_NAMESPACE" rollout status deployment/proxy --timeout=180s
+diff --git a/Dockerfile b/Dockerfile
+index 33cac222..87115c8c 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -9,6 +9,11 @@ WORKDIR /app
+ 
+ COPY . .
+ 
++# Build-time base path for subpath deployments (e.g. /docmost/).
++# Defaults to "/" so a plain build keeps serving from the root.
++ARG BASE_PATH=/
++ENV BASE_PATH=${BASE_PATH}
++
+ RUN pnpm install --frozen-lockfile
+ RUN pnpm build
+ 
+diff --git a/apps/client/src/ee/oauth/pages/oauth-consent.tsx b/apps/client/src/ee/oauth/pages/oauth-consent.tsx
+index a19b6082..47d7375b 100644
+--- a/apps/client/src/ee/oauth/pages/oauth-consent.tsx
++++ b/apps/client/src/ee/oauth/pages/oauth-consent.tsx
+@@ -35,7 +35,10 @@ import useCurrentUser from "@/features/user/hooks/use-current-user";
+ import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
+ import { logout } from "@/features/auth/services/auth-service";
+ import { ICurrentUser } from "@/features/user/types/user.types";
+-import APP_ROUTE from "@/lib/app-route.ts";
++import APP_ROUTE, {
++  stripBasePath,
++  withBasePath,
++} from "@/lib/app-route.ts";
+ import {
+   approveOAuthAuthorization,
+   getOAuthAuthorizeInfo,
+@@ -47,7 +50,10 @@ import {
+ } from "@/ee/oauth/types/oauth.types";
+ 
+ function loginRedirectUrl(pathname: string, search: string): string {
+-  return `${APP_ROUTE.AUTH.LOGIN}?redirect=${encodeURIComponent(pathname + search)}`;
++  // The redirect target is consumed by the router (basename-aware), so it
++  // must be stored without the base path; the login URL itself is a raw
++  // navigation and therefore needs the base path prefixed.
++  return `${withBasePath(APP_ROUTE.AUTH.LOGIN)}?redirect=${encodeURIComponent(stripBasePath(pathname) + search)}`;
+ }
+ 
+ function errorStatus(error: any): number | undefined {
+diff --git a/apps/client/src/features/auth/hooks/use-auth.ts b/apps/client/src/features/auth/hooks/use-auth.ts
+index 970a8589..3b2718b9 100644
+--- a/apps/client/src/features/auth/hooks/use-auth.ts
++++ b/apps/client/src/features/auth/hooks/use-auth.ts
+@@ -23,7 +23,7 @@ import {
+   acceptInvitation,
+   createWorkspace,
+ } from "@/features/workspace/services/workspace-service.ts";
+-import APP_ROUTE, { getPostLoginRedirect } from "@/lib/app-route.ts";
++import APP_ROUTE, { getPostLoginRedirect, withBasePath } from "@/lib/app-route.ts";
+ import { RESET } from "jotai/utils";
+ import { useTranslation } from "react-i18next";
+ import { isCloud } from "@/lib/config.ts";
+@@ -166,7 +166,7 @@ export default function useAuth() {
+   const handleLogout = async () => {
+     setCurrentUser(RESET);
+     await logout();
+-    window.location.replace(`${APP_ROUTE.AUTH.LOGIN}?logout=1`);
++    window.location.replace(`${withBasePath(APP_ROUTE.AUTH.LOGIN)}?logout=1`);
+   };
+ 
+   const handleForgotPassword = async (data: IForgotPassword) => {
+diff --git a/apps/client/src/lib/api-client.ts b/apps/client/src/lib/api-client.ts
+index cde9317a..c50994ef 100644
+--- a/apps/client/src/lib/api-client.ts
++++ b/apps/client/src/lib/api-client.ts
+@@ -1,9 +1,13 @@
+ import axios, { AxiosInstance } from "axios";
+-import APP_ROUTE from "@/lib/app-route.ts";
++import APP_ROUTE, {
++  getBasePath,
++  stripBasePath,
++  withBasePath,
++} from "@/lib/app-route.ts";
+ import { isCloud } from "@/lib/config.ts";
+ 
+ const api: AxiosInstance = axios.create({
+-  baseURL: "/api",
++  baseURL: `${getBasePath()}/api`,
+   withCredentials: true,
+ });
+ 
+@@ -17,7 +21,7 @@ api.interceptors.response.use(
+       "/api/bases/export-csv",
+     ];
+     if (response.request.responseURL) {
+-      const path = new URL(response.request.responseURL)?.pathname;
++      const path = stripBasePath(new URL(response.request.responseURL)?.pathname);
+       if (path && exemptEndpoints.includes(path)) {
+         return response;
+       }
+@@ -29,14 +33,12 @@ api.interceptors.response.use(
+     if (error.response) {
+       switch (error.response.status) {
+         case 401: {
+-          const url = new URL(error.request.responseURL)?.pathname;
++          const url = stripBasePath(new URL(error.request.responseURL)?.pathname);
++          const locationPath = stripBasePath(window.location.pathname);
+           if (url === "/api/auth/collab-token") return;
+-          if (window.location.pathname.startsWith("/share/")) return;
++          if (locationPath.startsWith("/share/")) return;
+           // public docs probe authed endpoints; reject without the login redirect
+-          if (
+-            window.location.pathname === "/docs" ||
+-            window.location.pathname.startsWith("/docs/")
+-          ) {
++          if (locationPath === "/docs" || locationPath.startsWith("/docs/")) {
+             break;
+           }
+ 
+@@ -57,9 +59,9 @@ api.interceptors.response.use(
+             console.log("workspace not found");
+             if (
+               !isCloud() &&
+-              window.location.pathname != APP_ROUTE.AUTH.SETUP
++              stripBasePath(window.location.pathname) != APP_ROUTE.AUTH.SETUP
+             ) {
+-              window.location.href = APP_ROUTE.AUTH.SETUP;
++              window.location.href = withBasePath(APP_ROUTE.AUTH.SETUP);
+             }
+           }
+           break;
+@@ -86,13 +88,14 @@ function redirectToLogin() {
+     // the oauth consent page redirects to login itself, preserving its query string
+     "/oauth/consent",
+   ];
+-  if (!exemptPaths.some((path) => window.location.pathname.startsWith(path))) {
+-    const redirectTo = window.location.pathname;
++  const path = stripBasePath(window.location.pathname);
++  if (!exemptPaths.some((p) => path.startsWith(p))) {
++    const redirectTo = path;
+     if (redirectTo === APP_ROUTE.HOME) {
+-      window.location.href = APP_ROUTE.AUTH.LOGIN;
++      window.location.href = withBasePath(APP_ROUTE.AUTH.LOGIN);
+     } else {
+       const params = new URLSearchParams({ redirect: redirectTo });
+-      window.location.href = `${APP_ROUTE.AUTH.LOGIN}?${params.toString()}`;
++      window.location.href = `${withBasePath(APP_ROUTE.AUTH.LOGIN)}?${params.toString()}`;
+     }
+   }
+ }
+diff --git a/apps/client/src/lib/app-route.ts b/apps/client/src/lib/app-route.ts
+index 48c1b87d..96004e4c 100644
+--- a/apps/client/src/lib/app-route.ts
++++ b/apps/client/src/lib/app-route.ts
+@@ -1,3 +1,26 @@
++// Build-time base path without trailing slash: "" for root deployments,
++// "/docmost" for subpath deployments.
++const BASE_PATH = import.meta.env.BASE_URL.replace(/\/+$/, "");
++
++export function getBasePath(): string {
++  return BASE_PATH;
++}
++
++// Prefix a root-absolute app path for raw (non-router) navigations, e.g.
++// window.location.href = withBasePath(APP_ROUTE.AUTH.LOGIN).
++export function withBasePath(path: string): string {
++  return `${BASE_PATH}${path}`;
++}
++
++// Remove the base path from a location pathname so checks and redirect
++// params keep using plain app paths (e.g. "/docmost/login" -> "/login").
++export function stripBasePath(pathname: string): string {
++  if (BASE_PATH && pathname.startsWith(BASE_PATH)) {
++    return pathname.slice(BASE_PATH.length) || "/";
++  }
++  return pathname;
++}
++
+ const APP_ROUTE = {
+   HOME: "/home",
+   SPACES: "/spaces",
+diff --git a/apps/client/src/lib/config.ts b/apps/client/src/lib/config.ts
+index 24601711..a5115fd5 100644
+--- a/apps/client/src/lib/config.ts
++++ b/apps/client/src/lib/config.ts
+@@ -14,7 +14,12 @@ export function getAppName(): string {
+ }
+ 
+ export function getAppUrl(): string {
+-  return `${window.location.protocol}//${window.location.host}`;
++  // Include the base path (e.g. https://example.com/docmost) so that API,
++  // avatar, file and share URLs automatically live under the subpath.
++  return `${window.location.origin}${import.meta.env.BASE_URL}`.replace(
++    /\/+$/,
++    "",
++  );
+ }
+ 
+ export function getServerAppUrl(): string {
+@@ -30,7 +35,9 @@ export function getCollaborationUrl(): string {
+     getConfigValue("COLLAB_URL") ||
+     (import.meta.env.DEV ? process.env.APP_URL : getAppUrl());
+ 
+-  const collabUrl = new URL("/collab", baseUrl);
++  // Resolve relative to the base path so it becomes
++  // wss://host/<base-path>/collab (unless COLLAB_URL is set explicitly).
++  const collabUrl = new URL("collab", `${baseUrl}/`);
+   collabUrl.protocol = collabUrl.protocol === "https:" ? "wss:" : "ws:";
+   return collabUrl.toString();
+ }
+diff --git a/apps/client/src/main.tsx b/apps/client/src/main.tsx
+index 5dbf6b81..60beb5c8 100644
+--- a/apps/client/src/main.tsx
++++ b/apps/client/src/main.tsx
+@@ -47,7 +47,9 @@ const container = document.getElementById("root") as HTMLElement;
+ const root = (container as any).__reactRoot ??= ReactDOM.createRoot(container);
+ 
+ root.render(
+-  <BrowserRouter>
++  // Respect the build-time base path so client-side routes live under it
++  // (e.g. /docmost/login instead of /login).
++  <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/+$/, "")}>
+     <MantineProvider theme={theme} cssVariablesResolver={mantineCssResolver}>
+       <ModalsProvider>
+         <QueryClientProvider client={queryClient}>
+diff --git a/apps/client/vite.config.ts b/apps/client/vite.config.ts
+index e4361fb4..98e5dab2 100644
+--- a/apps/client/vite.config.ts
++++ b/apps/client/vite.config.ts
+@@ -4,6 +4,10 @@ import * as path from "path";
+ 
+ const envPath = path.resolve(process.cwd(), "..", "..");
+ 
++// Base path for subpath deployments (e.g. BASE_PATH=/docmost/ makes the app
++// live under https://example.com/docmost/). Must start and end with "/".
++const BASE_PATH = process.env.BASE_PATH?.replace(/\/*$/, "/") || "/";
++
+ export default defineConfig(({ mode }) => {
+   const {
+     APP_URL,
+@@ -21,6 +25,7 @@ export default defineConfig(({ mode }) => {
+   } = loadEnv(mode, envPath, "");
+ 
+   return {
++    base: BASE_PATH,
+     define: {
+       "process.env": {
+         APP_URL,
+diff --git a/apps/server/src/integrations/environment/environment.service.ts b/apps/server/src/integrations/environment/environment.service.ts
+index 96d17401..2730dcab 100644
+--- a/apps/server/src/integrations/environment/environment.service.ts
++++ b/apps/server/src/integrations/environment/environment.service.ts
+@@ -19,8 +19,9 @@ export class EnvironmentService {
+       this.configService.get<string>('APP_URL') ||
+       `http://localhost:${this.getPort()}`;
+ 
+-    const { origin } = new URL(rawUrl);
+-    return origin;
++    // Keep the path (e.g. https://example.com/docmost) so the client config
++    // and email links include the deployment subpath.
++    return rawUrl.replace(/\/+$/, '');
+   }
+ 
+   isHttps(): boolean {
+diff --git a/deploy/k8s/00-namespace.yaml b/deploy/k8s/00-namespace.yaml
+new file mode 100644
+index 00000000..35494b59
+--- /dev/null
++++ b/deploy/k8s/00-namespace.yaml
+@@ -0,0 +1,7 @@
++# SPDX-License-Identifier: MIT
++#
++# Docmost subpath deployment - namespace.
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: docmost
+diff --git a/deploy/k8s/01-configmap.yaml b/deploy/k8s/01-configmap.yaml
+new file mode 100644
+index 00000000..39ec5a47
+--- /dev/null
++++ b/deploy/k8s/01-configmap.yaml
+@@ -0,0 +1,59 @@
++# SPDX-License-Identifier: MIT
++#
++# Non-secret configuration for the Docmost workloads.
++# APP_URL MUST be the externally visible URL including the subpath (without
++# trailing slash). In minikube with a port-forward to 20867 this is
++# http://localhost:20867/docmost ; on the work cluster replace host/protocol
++# accordingly (the .gitlab-ci.yml overwrites this ConfigMap on deploy).
++#
++# Do NOT set COLLAB_URL: the editor websocket URL is derived from APP_URL
++# and reaches the container through the proxy as /collab.
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: docmost-env
++  namespace: docmost
++data:
++  APP_URL: "http://localhost:20867/docmost"
++  REDIS_URL: "redis://redis:6379"
++---
++# Same Caddyfile as docker/Caddyfile - the "docmost" upstream is the
++# Kubernetes Service in this namespace, so no path changes are needed.
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: docmost-proxy-config
++  namespace: docmost
++data:
++  Caddyfile: |
++    # Trust the nginx ingress (pod IPs are in private ranges) so that the
++    # external scheme/host it provides are preserved.
++    {
++    	servers {
++    		trusted_proxies static private_ranges
++    	}
++    }
++
++    :80
++
++    log {
++    	output stdout
++    	level WARN
++    	format console
++    }
++
++    # Single upstream: strip the whole prefix, Docmost serves root paths.
++    @subpath path /docmost /docmost/*
++    handle @subpath {
++    	uri strip_prefix /docmost
++    	reverse_proxy http://docmost:3000
++    }
++
++    handle / {
++    	header Location /docmost
++    	respond 302
++    }
++
++    handle {
++    	respond 404
++    }
+diff --git a/deploy/k8s/02-secret.yaml b/deploy/k8s/02-secret.yaml
+new file mode 100644
+index 00000000..adcec819
+--- /dev/null
++++ b/deploy/k8s/02-secret.yaml
+@@ -0,0 +1,16 @@
++# SPDX-License-Identifier: MIT
++#
++# WARNING: these values are for local/minikube testing only.
++# On the work cluster replace them, e.g. with Sealed-Secrets / External-Secrets
++# or at least `kubectl create secret generic docmost-secret --from-literal=...`.
++apiVersion: v1
++kind: Secret
++metadata:
++  name: docmost-secret
++  namespace: docmost
++type: Opaque
++stringData:
++  # At least 32 characters!
++  APP_SECRET: "local-minikube-app-secret-change-me-00000001"
++  POSTGRES_PASSWORD: "docmost"
++  DATABASE_URL: "postgresql://docmost:docmost@db:5432/docmost"
+diff --git a/deploy/k8s/10-postgres.yaml b/deploy/k8s/10-postgres.yaml
+new file mode 100644
+index 00000000..3794b94a
+--- /dev/null
++++ b/deploy/k8s/10-postgres.yaml
+@@ -0,0 +1,86 @@
++# SPDX-License-Identifier: MIT
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: db
++  namespace: docmost
++  labels:
++    app: docmost-db
++spec:
++  replicas: 1
++  strategy:
++    type: Recreate
++  selector:
++    matchLabels:
++      app: docmost-db
++  template:
++    metadata:
++      labels:
++        app: docmost-db
++    spec:
++      containers:
++        - name: postgres
++          image: postgres:18
++          ports:
++            - containerPort: 5432
++          env:
++            - name: POSTGRES_USER
++              value: docmost
++            - name: POSTGRES_DB
++              value: docmost
++            - name: POSTGRES_PASSWORD
++              valueFrom:
++                secretKeyRef:
++                  name: docmost-secret
++                  key: POSTGRES_PASSWORD
++          volumeMounts:
++            - name: db-data
++              mountPath: /var/lib/postgresql
++          # NOTE: kubernetes exec probes run the array directly - there is no
++          # shell, so docker-compose's "CMD-SHELL" form does NOT work here.
++          readinessProbe:
++            exec:
++              command: ["pg_isready", "-U", "docmost", "-d", "docmost"]
++            initialDelaySeconds: 5
++            periodSeconds: 5
++          livenessProbe:
++            exec:
++              command: ["pg_isready", "-U", "docmost", "-d", "docmost"]
++            initialDelaySeconds: 15
++            periodSeconds: 15
++          resources:
++            requests:
++              cpu: "50m"
++              memory: "128Mi"
++            limits:
++              cpu: "500m"
++              memory: "512Mi"
++      volumes:
++        - name: db-data
++          persistentVolumeClaim:
++            claimName: docmost-db-data
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: db
++  namespace: docmost
++spec:
++  selector:
++    app: docmost-db
++  ports:
++    - port: 5432
++      targetPort: 5432
++      protocol: TCP
++---
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: docmost-db-data
++  namespace: docmost
++spec:
++  accessModes:
++    - ReadWriteOnce
++  resources:
++    requests:
++      storage: 1Gi
+diff --git a/deploy/k8s/20-redis.yaml b/deploy/k8s/20-redis.yaml
+new file mode 100644
+index 00000000..0c2d4468
+--- /dev/null
++++ b/deploy/k8s/20-redis.yaml
+@@ -0,0 +1,54 @@
++# SPDX-License-Identifier: MIT
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: redis
++  namespace: docmost
++  labels:
++    app: docmost-redis
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: docmost-redis
++  template:
++    metadata:
++      labels:
++        app: docmost-redis
++    spec:
++      containers:
++        - name: redis
++          image: redis:8
++          args:
++            - redis-server
++            - --appendonly
++            - "yes"
++            - --maxmemory-policy
++            - noeviction
++          ports:
++            - containerPort: 6379
++          readinessProbe:
++            tcpSocket:
++              port: 6379
++            initialDelaySeconds: 3
++            periodSeconds: 10
++          resources:
++            requests:
++              cpu: "25m"
++              memory: "32Mi"
++            limits:
++              cpu: "250m"
++              memory: "256Mi"
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: redis
++  namespace: docmost
++spec:
++  selector:
++    app: docmost-redis
++  ports:
++    - port: 6379
++      targetPort: 6379
++      protocol: TCP
+diff --git a/deploy/k8s/30-docmost.yaml b/deploy/k8s/30-docmost.yaml
+new file mode 100644
+index 00000000..d9aae3b3
+--- /dev/null
++++ b/deploy/k8s/30-docmost.yaml
+@@ -0,0 +1,102 @@
++# SPDX-License-Identifier: MIT
++#
++# The Docmost application (NestJS server + built client in one image).
++# The client inside was built with BASE_PATH=/docmost/, but the container
++# itself serves root paths - the prefix is handled by the proxy.
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: docmost
++  namespace: docmost
++  labels:
++    app: docmost
++spec:
++  replicas: 1
++  strategy:
++    type: Recreate
++  selector:
++    matchLabels:
++      app: docmost
++  template:
++    metadata:
++      labels:
++        app: docmost
++    spec:
++      containers:
++        - name: docmost
++          image: docmost:dev
++          ports:
++            - containerPort: 3000
++          env:
++            - name: APP_URL
++              valueFrom:
++                configMapKeyRef:
++                  name: docmost-env
++                  key: APP_URL
++            - name: APP_SECRET
++              valueFrom:
++                secretKeyRef:
++                  name: docmost-secret
++                  key: APP_SECRET
++            - name: DATABASE_URL
++              valueFrom:
++                secretKeyRef:
++                  name: docmost-secret
++                  key: DATABASE_URL
++            - name: REDIS_URL
++              valueFrom:
++                configMapKeyRef:
++                  name: docmost-env
++                  key: REDIS_URL
++          volumeMounts:
++            - name: storage
++              mountPath: /app/data/storage
++          readinessProbe:
++            httpGet:
++              path: /api/health
++              port: 3000
++            initialDelaySeconds: 10
++            periodSeconds: 10
++          livenessProbe:
++            httpGet:
++              path: /api/health
++              port: 3000
++            initialDelaySeconds: 30
++            periodSeconds: 20
++          resources:
++            requests:
++              cpu: "100m"
++              memory: "256Mi"
++            limits:
++              cpu: "1"
++              memory: "1Gi"
++      volumes:
++        - name: storage
++          persistentVolumeClaim:
++            claimName: docmost-storage
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: docmost
++  namespace: docmost
++spec:
++  selector:
++    app: docmost
++  ports:
++    - name: http
++      port: 3000
++      targetPort: 3000
++      protocol: TCP
++---
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: docmost-storage
++  namespace: docmost
++spec:
++  accessModes:
++    - ReadWriteOnce
++  resources:
++    requests:
++      storage: 2Gi
+diff --git a/deploy/k8s/40-proxy.yaml b/deploy/k8s/40-proxy.yaml
+new file mode 100644
+index 00000000..18c2ef7b
+--- /dev/null
++++ b/deploy/k8s/40-proxy.yaml
+@@ -0,0 +1,62 @@
++# SPDX-License-Identifier: MIT
++#
++# Caddy is the in-cluster entry point. It strips /docmost for every request
++# (Docmost is a single app) and redirects bare / to the subpath. The ingress
++# only routes the /docmost path to this service (no rewrite there).
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: proxy
++  namespace: docmost
++  labels:
++    app: docmost-proxy
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: docmost-proxy
++  template:
++    metadata:
++      labels:
++        app: docmost-proxy
++    spec:
++      containers:
++        - name: caddy
++          image: caddy:2
++          ports:
++            - containerPort: 80
++          volumeMounts:
++            - name: caddyfile
++              mountPath: /etc/caddy/Caddyfile
++              subPath: Caddyfile
++              readOnly: true
++          readinessProbe:
++            tcpSocket:
++              port: 80
++            initialDelaySeconds: 3
++            periodSeconds: 10
++          resources:
++            requests:
++              cpu: "25m"
++              memory: "32Mi"
++            limits:
++              cpu: "250m"
++              memory: "128Mi"
++      volumes:
++        - name: caddyfile
++          configMap:
++            name: docmost-proxy-config
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: proxy
++  namespace: docmost
++spec:
++  selector:
++    app: docmost-proxy
++  ports:
++    - name: http
++      port: 80
++      targetPort: 80
++      protocol: TCP
+diff --git a/deploy/k8s/50-ingress.yaml b/deploy/k8s/50-ingress.yaml
+new file mode 100644
+index 00000000..89523e8f
+--- /dev/null
++++ b/deploy/k8s/50-ingress.yaml
+@@ -0,0 +1,37 @@
++# SPDX-License-Identifier: MIT
++#
++# Requires the ingress-nginx controller:
++#   minikube addons enable ingress
++#
++# IMPORTANT: there is deliberately NO rewrite-target annotation. The whole
++# /docmost path is passed to Caddy unchanged; stripping happens in Caddy.
++apiVersion: networking.k8s.io/v1
++kind: Ingress
++metadata:
++  name: docmost
++  namespace: docmost
++  annotations:
++    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
++    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
++    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
++spec:
++  ingressClassName: nginx
++  rules:
++    # No host restriction so http://localhost:20867 works during local tests.
++    # Add "- host: docs.example.com" for the work cluster if desired.
++    - http:
++        paths:
++          - path: /docmost
++            pathType: Exact
++            backend:
++              service:
++                name: proxy
++                port:
++                  number: 80
++          - path: /docmost/
++            pathType: Prefix
++            backend:
++              service:
++                name: proxy
++                port:
++                  number: 80
+diff --git a/docker/Caddyfile b/docker/Caddyfile
+new file mode 100644
+index 00000000..22ed6eb9
+--- /dev/null
++++ b/docker/Caddyfile
+@@ -0,0 +1,51 @@
++#
++# Docmost is served under the /docmost subpath:
++#
++#   http(s)://<host>/docmost/**
++#
++# Docmost is a single app (NestJS serving the built React client), so there
++# is only ONE upstream: the whole prefix is STRIPPED and the container keeps
++# serving root paths (/api/..., /collab websocket, /assets/..., SPA routes).
++#
++# The client was built with BASE_PATH=/docmost/, so every URL it generates
++# (API calls, websocket, avatars, files, share links) already carries the
++# prefix and lands back on this proxy unchanged.
++
++# Trust reverse proxies in private networks (e.g. the nginx ingress in
++# Kubernetes) so Caddy preserves their X-Forwarded-* headers instead of
++# overwriting them with its plain-HTTP internal hop.
++{
++	servers {
++		trusted_proxies static private_ranges
++	}
++}
++
++:80
++
++log {
++	output stdout
++	level WARN
++	format console
++}
++
++# Everything under the subpath (including the bare prefix) goes to Docmost
++# with the prefix stripped. Caddy upgrades websocket connections (the
++# /collab editor websocket) automatically.
++# Do NOT set X-Forwarded-Host manually: the {host} placeholder omits the
++# port; Caddy's automatic header keeps the full host.
++@subpath path /docmost /docmost/*
++handle @subpath {
++	uri strip_prefix /docmost
++	reverse_proxy http://docmost:3000
++}
++
++# Convenience: visiting the root jumps to the subpath. NOTE: 'redir' cannot
++# be used here - its first argument is always parsed as a matcher.
++handle / {
++	header Location /docmost
++	respond 302
++}
++
++handle {
++	respond 404
++}
+diff --git a/docker/docker-compose.yml b/docker/docker-compose.yml
+new file mode 100644
+index 00000000..7b24b05b
+--- /dev/null
++++ b/docker/docker-compose.yml
+@@ -0,0 +1,79 @@
++#
++# Local test setup serving Docmost under http://localhost:20867/docmost/
++#
++#   docker compose -f docker/docker-compose.yml up -d --build
++#
++# The image is built from this repository (not pulled) so that the local
++# subpath changes take effect. The client build bakes in the BASE_PATH
++# build argument. Do NOT set COLLAB_URL - the websocket is derived from
++# APP_URL and proxied through Caddy.
++---
++services:
++  docmost:
++    build:
++      context: ..
++      dockerfile: Dockerfile
++      args:
++        # Baked into the client build; change together with the prefix in
++        # the Caddyfile. Keep the trailing slash.
++        BASE_PATH: ${BASE_PATH:-/docmost/}
++    image: docmost:dev
++    restart: unless-stopped
++    environment:
++      # No trailing slash: links are concatenated on it.
++      APP_URL: ${APP_URL:-http://localhost:20867/docmost}
++      APP_SECRET: ${APP_SECRET:-local-development-app-secret-change-me-0001}
++      DATABASE_URL: postgresql://docmost:${POSTGRES_PASSWORD:-docmost}@db:5432/docmost
++      REDIS_URL: redis://redis:6379
++    volumes:
++      - docmost_storage:/app/data/storage
++    depends_on:
++      db:
++        condition: service_healthy
++      redis:
++        condition: service_healthy
++
++  db:
++    image: postgres:18
++    restart: unless-stopped
++    environment:
++      POSTGRES_DB: docmost
++      POSTGRES_USER: docmost
++      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-docmost}
++    volumes:
++      - docmost_db_data:/var/lib/postgresql
++    healthcheck:
++      test: ["CMD-SHELL", "pg_isready -U docmost -d docmost"]
++      interval: 5s
++      timeout: 5s
++      retries: 20
++
++  redis:
++    image: redis:8
++    restart: unless-stopped
++    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
++    volumes:
++      - docmost_redis_data:/data
++    healthcheck:
++      test: ["CMD", "redis-cli", "ping"]
++      interval: 5s
++      timeout: 3s
++      retries: 20
++
++  proxy:
++    image: caddy:2
++    restart: unless-stopped
++    ports:
++      # Open http://localhost:20867/docmost/
++      - "20867:80"
++    volumes:
++      - ./Caddyfile:/etc/caddy/Caddyfile:ro
++      - caddy_data:/data
++    depends_on:
++      - docmost
++
++volumes:
++  docmost_storage:
++  docmost_db_data:
++  docmost_redis_data:
++  caddy_data:

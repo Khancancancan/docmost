@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: MIT
+#
+# Caddy is the in-cluster entry point. It strips /docmost for every request
+# (Docmost is a single app) and redirects bare / to the subpath. The ingress
+# only routes the /docmost path to this service (no rewrite there).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxy
+  namespace: docmost
+  labels:
+    app: docmost-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: docmost-proxy
+  template:
+    metadata:
+      labels:
+        app: docmost-proxy
+    spec:
+      containers:
+        - name: caddy
+          image: caddy:2
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: caddyfile
+              mountPath: /etc/caddy/Caddyfile
+              subPath: Caddyfile
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "25m"
+              memory: "32Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+      volumes:
+        - name: caddyfile
+          configMap:
+            name: docmost-proxy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxy
+  namespace: docmost
+spec:
+  selector:
+    app: docmost-proxy
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP

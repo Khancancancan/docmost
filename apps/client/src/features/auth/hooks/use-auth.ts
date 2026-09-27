@@ -23,7 +23,7 @@ import {
   acceptInvitation,
   createWorkspace,
 } from "@/features/workspace/services/workspace-service.ts";
-import APP_ROUTE, { getPostLoginRedirect } from "@/lib/app-route.ts";
+import APP_ROUTE, { getPostLoginRedirect, withBasePath } from "@/lib/app-route.ts";
 import { RESET } from "jotai/utils";
 import { useTranslation } from "react-i18next";
 import { isCloud } from "@/lib/config.ts";
@@ -166,7 +166,7 @@ export default function useAuth() {
   const handleLogout = async () => {
     setCurrentUser(RESET);
     await logout();
-    window.location.replace(`${APP_ROUTE.AUTH.LOGIN}?logout=1`);
+    window.location.replace(`${withBasePath(APP_ROUTE.AUTH.LOGIN)}?logout=1`);
   };
 
   const handleForgotPassword = async (data: IForgotPassword) => {

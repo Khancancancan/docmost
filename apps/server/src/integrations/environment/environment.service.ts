@@ -19,8 +19,9 @@ export class EnvironmentService {
       this.configService.get<string>('APP_URL') ||
       `http://localhost:${this.getPort()}`;
 
-    const { origin } = new URL(rawUrl);
-    return origin;
+    // Keep the path (e.g. https://example.com/docmost) so the client config
+    // and email links include the deployment subpath.
+    return rawUrl.replace(/\/+$/, '');
   }
 
   isHttps(): boolean {

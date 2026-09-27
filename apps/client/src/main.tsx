@@ -47,7 +47,9 @@ const container = document.getElementById("root") as HTMLElement;
 const root = (container as any).__reactRoot ??= ReactDOM.createRoot(container);
 
 root.render(
-  <BrowserRouter>
+  // Respect the build-time base path so client-side routes live under it
+  // (e.g. /docmost/login instead of /login).
+  <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/+$/, "")}>
     <MantineProvider theme={theme} cssVariablesResolver={mantineCssResolver}>
       <ModalsProvider>
         <QueryClientProvider client={queryClient}>

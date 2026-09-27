@@ -9,6 +9,11 @@ WORKDIR /app
 
 COPY . .
 
+# Build-time base path for subpath deployments (e.g. /docmost/).
+# Defaults to "/" so a plain build keeps serving from the root.
+ARG BASE_PATH=/
+ENV BASE_PATH=${BASE_PATH}
+
 RUN pnpm install --frozen-lockfile
 RUN pnpm build
 

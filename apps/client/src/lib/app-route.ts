@@ -1,3 +1,26 @@
+// Build-time base path without trailing slash: "" for root deployments,
+// "/docmost" for subpath deployments.
+const BASE_PATH = import.meta.env.BASE_URL.replace(/\/+$/, "");
+
+export function getBasePath(): string {
+  return BASE_PATH;
+}
+
+// Prefix a root-absolute app path for raw (non-router) navigations, e.g.
+// window.location.href = withBasePath(APP_ROUTE.AUTH.LOGIN).
+export function withBasePath(path: string): string {
+  return `${BASE_PATH}${path}`;
+}
+
+// Remove the base path from a location pathname so checks and redirect
+// params keep using plain app paths (e.g. "/docmost/login" -> "/login").
+export function stripBasePath(pathname: string): string {
+  if (BASE_PATH && pathname.startsWith(BASE_PATH)) {
+    return pathname.slice(BASE_PATH.length) || "/";
+  }
+  return pathname;
+}
+
 const APP_ROUTE = {
   HOME: "/home",
   SPACES: "/spaces",

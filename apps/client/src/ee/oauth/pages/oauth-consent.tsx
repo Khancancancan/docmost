@@ -35,7 +35,10 @@ import useCurrentUser from "@/features/user/hooks/use-current-user";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
 import { logout } from "@/features/auth/services/auth-service";
 import { ICurrentUser } from "@/features/user/types/user.types";
-import APP_ROUTE from "@/lib/app-route.ts";
+import APP_ROUTE, {
+  stripBasePath,
+  withBasePath,
+} from "@/lib/app-route.ts";
 import {
   approveOAuthAuthorization,
   getOAuthAuthorizeInfo,
@@ -47,7 +50,10 @@ import {
 } from "@/ee/oauth/types/oauth.types";
 
 function loginRedirectUrl(pathname: string, search: string): string {
-  return `${APP_ROUTE.AUTH.LOGIN}?redirect=${encodeURIComponent(pathname + search)}`;
+  // The redirect target is consumed by the router (basename-aware), so it
+  // must be stored without the base path; the login URL itself is a raw
+  // navigation and therefore needs the base path prefixed.
+  return `${withBasePath(APP_ROUTE.AUTH.LOGIN)}?redirect=${encodeURIComponent(stripBasePath(pathname) + search)}`;
 }
 
 function errorStatus(error: any): number | undefined {

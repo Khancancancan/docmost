@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: MIT
+#
+# Pipeline for the /docmost subpath build.
+#
+# Required GitLab CI/CD variables (Settings -> CI/CD -> Variables):
+#   KUBE_CONFIG  kubeconfig of a service account that can manage the
+#                "docmost" namespace on the work cluster
+#   APP_URL      external URL incl. subpath, e.g. https://docs.example.com/docmost
+#
+# The GitLab built-in variables CI_REGISTRY / CI_REGISTRY_IMAGE /
+# CI_REGISTRY_USER / CI_REGISTRY_PASSWORD are used automatically.
+# Docker-in-Docker jobs require a runner with the "privileged" mode enabled.
+
+stages:
+  - build
+  - deploy
+
+variables:
+  BASE_PATH: "/docmost/"
+  DEPLOY_NAMESPACE: "docmost"
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_BUILDKIT: "1"
+
+# ---------------------------------------------------------------------------
+# Build the application image from this repository. Docmost is a single app
+# (NestJS server + built React client); the client build bakes in
+# BASE_PATH=${BASE_PATH}.
+# ---------------------------------------------------------------------------
+
+build:docmost:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - docker build
+      --build-arg BASE_PATH=$BASE_PATH
+      -f Dockerfile
+      -t "$CI_REGISTRY_IMAGE/docmost:$CI_COMMIT_SHA"
+      -t "$CI_REGISTRY_IMAGE/docmost:latest"
+      .
+    - docker push "$CI_REGISTRY_IMAGE/docmost:$CI_COMMIT_SHA"
+    - docker push "$CI_REGISTRY_IMAGE/docmost:latest"
+
+# ---------------------------------------------------------------------------
+# Deploy manifests and roll the new image out.
+# Manifests live in deploy/k8s (namespace, configmap, secret, postgres,
+# redis, docmost, caddy proxy, ingress).
+# ---------------------------------------------------------------------------
+
+deploy:production:
+  stage: deploy
+  image: bitnami/kubectl:1.31
+  dependencies: []
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  before_script:
+    - test -n "$KUBE_CONFIG" || (echo "KUBE_CONFIG variable is required" && exit 1)
+    - test -n "$APP_URL" || (echo "APP_URL variable is required" && exit 1)
+    - mkdir -p "$HOME/.kube"
+    - echo "$KUBE_CONFIG" > "$HOME/.kube/config"
+  script:
+    - kubectl apply -f deploy/k8s
+    # Point the application to the real external URL (checked-in default is
+    # the local minikube URL). Other ConfigMap keys stay untouched.
+    - kubectl -n "$DEPLOY_NAMESPACE" patch configmap docmost-env --type merge
+      -p "{\"data\":{\"APP_URL\":\"$APP_URL\"}}"
+    # Roll out the freshly built image.
+    - kubectl -n "$DEPLOY_NAMESPACE" set image deployment/docmost
+      docmost="$CI_REGISTRY_IMAGE/docmost:$CI_COMMIT_SHA"
+    - kubectl -n "$DEPLOY_NAMESPACE" rollout status deployment/db --timeout=180s
+    - kubectl -n "$DEPLOY_NAMESPACE" rollout status deployment/redis --timeout=180s
+    - kubectl -n "$DEPLOY_NAMESPACE" rollout status deployment/docmost --timeout=300s
+    - kubectl -n "$DEPLOY_NAMESPACE" rollout restart deployment/proxy
+    - kubectl -n "$DEPLOY_NAMESPACE" rollout status deployment/proxy --timeout=180s

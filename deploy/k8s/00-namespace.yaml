@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+#
+# Docmost subpath deployment - namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: docmost

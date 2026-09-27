@@ -1,0 +1,51 @@
+#
+# Docmost is served under the /docmost subpath:
+#
+#   http(s)://<host>/docmost/**
+#
+# Docmost is a single app (NestJS serving the built React client), so there
+# is only ONE upstream: the whole prefix is STRIPPED and the container keeps
+# serving root paths (/api/..., /collab websocket, /assets/..., SPA routes).
+#
+# The client was built with BASE_PATH=/docmost/, so every URL it generates
+# (API calls, websocket, avatars, files, share links) already carries the
+# prefix and lands back on this proxy unchanged.
+
+# Trust reverse proxies in private networks (e.g. the nginx ingress in
+# Kubernetes) so Caddy preserves their X-Forwarded-* headers instead of
+# overwriting them with its plain-HTTP internal hop.
+{
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+:80
+
+log {
+	output stdout
+	level WARN
+	format console
+}
+
+# Everything under the subpath (including the bare prefix) goes to Docmost
+# with the prefix stripped. Caddy upgrades websocket connections (the
+# /collab editor websocket) automatically.
+# Do NOT set X-Forwarded-Host manually: the {host} placeholder omits the
+# port; Caddy's automatic header keeps the full host.
+@subpath path /docmost /docmost/*
+handle @subpath {
+	uri strip_prefix /docmost
+	reverse_proxy http://docmost:3000
+}
+
+# Convenience: visiting the root jumps to the subpath. NOTE: 'redir' cannot
+# be used here - its first argument is always parsed as a matcher.
+handle / {
+	header Location /docmost
+	respond 302
+}
+
+handle {
+	respond 404
+}

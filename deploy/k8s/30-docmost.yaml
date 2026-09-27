@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: MIT
+#
+# The Docmost application (NestJS server + built client in one image).
+# The client inside was built with BASE_PATH=/docmost/, but the container
+# itself serves root paths - the prefix is handled by the proxy.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docmost
+  namespace: docmost
+  labels:
+    app: docmost
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: docmost
+  template:
+    metadata:
+      labels:
+        app: docmost
+    spec:
+      containers:
+        - name: docmost
+          image: docmost:dev
+          ports:
+            - containerPort: 3000
+          env:
+            - name: APP_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: docmost-env
+                  key: APP_URL
+            - name: APP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: docmost-secret
+                  key: APP_SECRET
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: docmost-secret
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: docmost-env
+                  key: REDIS_URL
+          volumeMounts:
+            - name: storage
+              mountPath: /app/data/storage
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: docmost-storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: docmost
+  namespace: docmost
+spec:
+  selector:
+    app: docmost
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+      protocol: TCP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: docmost-storage
+  namespace: docmost
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi

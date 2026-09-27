@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: MIT
+#
+# Non-secret configuration for the Docmost workloads.
+# APP_URL MUST be the externally visible URL including the subpath (without
+# trailing slash). In minikube with a port-forward to 20867 this is
+# http://localhost:20867/docmost ; on the work cluster replace host/protocol
+# accordingly (the .gitlab-ci.yml overwrites this ConfigMap on deploy).
+#
+# Do NOT set COLLAB_URL: the editor websocket URL is derived from APP_URL
+# and reaches the container through the proxy as /collab.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: docmost-env
+  namespace: docmost
+data:
+  APP_URL: "http://localhost:20867/docmost"
+  REDIS_URL: "redis://redis:6379"
+---
+# Same Caddyfile as docker/Caddyfile - the "docmost" upstream is the
+# Kubernetes Service in this namespace, so no path changes are needed.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: docmost-proxy-config
+  namespace: docmost
+data:
+  Caddyfile: |
+    # Trust the nginx ingress (pod IPs are in private ranges) so that the
+    # external scheme/host it provides are preserved.
+    {
+    	servers {
+    		trusted_proxies static private_ranges
+    	}
+    }
+
+    :80
+
+    log {
+    	output stdout
+    	level WARN
+    	format console
+    }
+
+    # Single upstream: strip the whole prefix, Docmost serves root paths.
+    @subpath path /docmost /docmost/*
+    handle @subpath {
+    	uri strip_prefix /docmost
+    	reverse_proxy http://docmost:3000
+    }
+
+    handle / {
+    	header Location /docmost
+    	respond 302
+    }
+
+    handle {
+    	respond 404
+    }

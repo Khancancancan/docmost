@@ -1,9 +1,13 @@
 import axios, { AxiosInstance } from "axios";
-import APP_ROUTE from "@/lib/app-route.ts";
+import APP_ROUTE, {
+  getBasePath,
+  stripBasePath,
+  withBasePath,
+} from "@/lib/app-route.ts";
 import { isCloud } from "@/lib/config.ts";
 
 const api: AxiosInstance = axios.create({
-  baseURL: "/api",
+  baseURL: `${getBasePath()}/api`,
   withCredentials: true,
 });
 
@@ -17,7 +21,7 @@ api.interceptors.response.use(
       "/api/bases/export-csv",
     ];
     if (response.request.responseURL) {
-      const path = new URL(response.request.responseURL)?.pathname;
+      const path = stripBasePath(new URL(response.request.responseURL)?.pathname);
       if (path && exemptEndpoints.includes(path)) {
         return response;
       }
@@ -29,14 +33,12 @@ api.interceptors.response.use(
     if (error.response) {
       switch (error.response.status) {
         case 401: {
-          const url = new URL(error.request.responseURL)?.pathname;
+          const url = stripBasePath(new URL(error.request.responseURL)?.pathname);
+          const locationPath = stripBasePath(window.location.pathname);
           if (url === "/api/auth/collab-token") return;
-          if (window.location.pathname.startsWith("/share/")) return;
+          if (locationPath.startsWith("/share/")) return;
           // public docs probe authed endpoints; reject without the login redirect
-          if (
-            window.location.pathname === "/docs" ||
-            window.location.pathname.startsWith("/docs/")
-          ) {
+          if (locationPath === "/docs" || locationPath.startsWith("/docs/")) {
             break;
           }
 
@@ -57,9 +59,9 @@ api.interceptors.response.use(
             console.log("workspace not found");
             if (
               !isCloud() &&
-              window.location.pathname != APP_ROUTE.AUTH.SETUP
+              stripBasePath(window.location.pathname) != APP_ROUTE.AUTH.SETUP
             ) {
-              window.location.href = APP_ROUTE.AUTH.SETUP;
+              window.location.href = withBasePath(APP_ROUTE.AUTH.SETUP);
             }
           }
           break;
@@ -86,13 +88,14 @@ function redirectToLogin() {
     // the oauth consent page redirects to login itself, preserving its query string
     "/oauth/consent",
   ];
-  if (!exemptPaths.some((path) => window.location.pathname.startsWith(path))) {
-    const redirectTo = window.location.pathname;
+  const path = stripBasePath(window.location.pathname);
+  if (!exemptPaths.some((p) => path.startsWith(p))) {
+    const redirectTo = path;
     if (redirectTo === APP_ROUTE.HOME) {
-      window.location.href = APP_ROUTE.AUTH.LOGIN;
+      window.location.href = withBasePath(APP_ROUTE.AUTH.LOGIN);
     } else {
       const params = new URLSearchParams({ redirect: redirectTo });
-      window.location.href = `${APP_ROUTE.AUTH.LOGIN}?${params.toString()}`;
+      window.location.href = `${withBasePath(APP_ROUTE.AUTH.LOGIN)}?${params.toString()}`;
     }
   }
 }

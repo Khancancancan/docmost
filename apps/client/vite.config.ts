@@ -4,6 +4,10 @@ import * as path from "path";
 
 const envPath = path.resolve(process.cwd(), "..", "..");
 
+// Base path for subpath deployments (e.g. BASE_PATH=/docmost/ makes the app
+// live under https://example.com/docmost/). Must start and end with "/".
+const BASE_PATH = process.env.BASE_PATH?.replace(/\/*$/, "/") || "/";
+
 export default defineConfig(({ mode }) => {
   const {
     APP_URL,
@@ -21,6 +25,7 @@ export default defineConfig(({ mode }) => {
   } = loadEnv(mode, envPath, "");
 
   return {
+    base: BASE_PATH,
     define: {
       "process.env": {
         APP_URL,

@@ -14,7 +14,12 @@ export function getAppName(): string {
 }
 
 export function getAppUrl(): string {
-  return `${window.location.protocol}//${window.location.host}`;
+  // Include the base path (e.g. https://example.com/docmost) so that API,
+  // avatar, file and share URLs automatically live under the subpath.
+  return `${window.location.origin}${import.meta.env.BASE_URL}`.replace(
+    /\/+$/,
+    "",
+  );
 }
 
 export function getServerAppUrl(): string {
@@ -30,7 +35,9 @@ export function getCollaborationUrl(): string {
     getConfigValue("COLLAB_URL") ||
     (import.meta.env.DEV ? process.env.APP_URL : getAppUrl());
 
-  const collabUrl = new URL("/collab", baseUrl);
+  // Resolve relative to the base path so it becomes
+  // wss://host/<base-path>/collab (unless COLLAB_URL is set explicitly).
+  const collabUrl = new URL("collab", `${baseUrl}/`);
   collabUrl.protocol = collabUrl.protocol === "https:" ? "wss:" : "ws:";
   return collabUrl.toString();
 }

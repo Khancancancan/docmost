@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MIT
+#
+# Requires the ingress-nginx controller:
+#   minikube addons enable ingress
+#
+# IMPORTANT: there is deliberately NO rewrite-target annotation. The whole
+# /docmost path is passed to Caddy unchanged; stripping happens in Caddy.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: docmost
+  namespace: docmost
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+    # No host restriction so http://localhost:20867 works during local tests.
+    # Add "- host: docs.example.com" for the work cluster if desired.
+    - http:
+        paths:
+          - path: /docmost
+            pathType: Exact
+            backend:
+              service:
+                name: proxy
+                port:
+                  number: 80
+          - path: /docmost/
+            pathType: Prefix
+            backend:
+              service:
+                name: proxy
+                port:
+                  number: 80

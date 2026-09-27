@@ -18,13 +18,18 @@ export interface CheatsheetInNewTabButtonProps {
  * Renders a button that opens the cheatsheet in a new tab.
  */
 export const CheatsheetInNewTabButton: React.FC<CheatsheetInNewTabButtonProps> = ({ onClick }) => {
+  const cheatsheetPath = `${process.env.NEXT_PUBLIC_BASE_PATH ?? ''}/cheatsheet`
   const openPopUp = useCallback(
     (event: MouseEvent<HTMLButtonElement>) => {
       event.preventDefault()
-      window.open('/cheatsheet', '_blank', 'menubar=no,width=1000,height=600,location=no,toolbar=no')
+      window.open(
+        cheatsheetPath,
+        '_blank',
+        'menubar=no,width=1000,height=600,location=no,toolbar=no'
+      )
       onClick?.()
     },
-    [onClick]
+    [cheatsheetPath, onClick]
   )
   const buttonVariant = useOutlineButtonVariant()
   const buttonTitle = useTranslatedText('cheatsheet.modal.popup')
@@ -33,7 +38,7 @@ export const CheatsheetInNewTabButton: React.FC<CheatsheetInNewTabButtonProps> =
     <IconButton
       size={'sm'}
       iconSize={1.2}
-      href={'/cheatsheet'}
+      href={cheatsheetPath}
       onClick={openPopUp}
       icon={BoxArrowUpRight}
       className={'p-2 border-0'}

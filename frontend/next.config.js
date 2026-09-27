@@ -12,6 +12,15 @@ const withBundleAnalyzer = require('@next/bundle-analyzer')({
 
 console.log('Node environment is', process.env.NODE_ENV)
 
+// Serve the whole frontend under a subpath (e.g. /hedgedoc) so it can be
+// exposed through an ingress that shares the host with other applications.
+// NEXT_PUBLIC_BASE_PATH is read at BUILD time (see frontend/docker/Dockerfile).
+// An empty value (default) keeps the app served at the root.
+const basePath = process.env.NEXT_PUBLIC_BASE_PATH || ''
+if (basePath) {
+  console.log(`Serving frontend under basePath '${basePath}'`)
+}
+
 if (isTestMode) {
   console.warn(`This build runs in test mode. This means:
  - No sandboxed iframe
@@ -58,6 +67,7 @@ const svgrConfig = {
 
 /** @type {import('next').NextConfig} */
 const rawNextConfig = {
+  basePath,
   webpack: (config) => {
     config.module.rules.push({
       test: /\.svg$/i,

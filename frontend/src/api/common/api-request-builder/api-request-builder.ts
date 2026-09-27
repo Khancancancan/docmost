@@ -48,7 +48,10 @@ export abstract class ApiRequestBuilder<ResponseType> {
       }
       return actualBaseUrl
     } else {
-      return baseUrl ?? '/'
+      // In the browser all requests are same-origin. Prefix the configured
+      // subpath so calls work when HedgeDoc is served under a base path.
+      const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? ''
+      return baseUrl ?? `${basePath}/`
     }
   }
 

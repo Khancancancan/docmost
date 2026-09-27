@@ -1,10 +1,29 @@
 #
-# SPDX-FileCopyrightText: 2023 The HedgeDoc developers (see AUTHORS file)
+# SPDX-FileCopyrightText: 2023 The HedgeDoc authors (see AUTHORS file)
 #
 # SPDX-License-Identifier: AGPL-3.0-only
 #
+# HedgeDoc is served under the /hedgedoc subpath:
+#
+#   http(s)://<host>/hedgedoc/**
+#
+# - Backend routes get the prefix STRIPPED, because the backend itself keeps
+#   serving on root paths (/api/..., /media/..., /public/..., /realtime).
+# - The frontend (Next.js) is built with basePath=/hedgedoc, so the prefix
+#   is KEPT and passed to the frontend unchanged.
 
-{$HD_BASE_URL}
+# Trust reverse proxies in private networks (e.g. the nginx ingress in
+# Kubernetes) so Caddy preserves their X-Forwarded-* headers. The frontend
+# compares X-Forwarded-Host / X-Forwarded-Proto against HD_BASE_URL and
+# refuses to render on mismatch, which matters when TLS is terminated at the
+# ingress and traffic reaches Caddy over plain HTTP.
+{
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+:80
 
 log {
 	output stdout
@@ -12,9 +31,33 @@ log {
 	format console
 }
 
-reverse_proxy /realtime http://backend:3000
-reverse_proxy /api/* http://backend:3000
-reverse_proxy /public/* http://backend:3000
-reverse_proxy /uploads/* http://backend:3000
-reverse_proxy /apidoc/* http://backend:3000
-reverse_proxy /* http://frontend:3001
+# Backend API, media files, public files and the realtime websocket.
+# Caddy upgrades websocket connections automatically.
+# Do NOT set X-Forwarded-Host manually: the {host} placeholder omits the port,
+# which breaks non-default-port setups; Caddy's automatic header keeps the
+# full host (and preserves the ingress-provided one via trusted_proxies).
+@backend path /hedgedoc/api/* /hedgedoc/media/* /hedgedoc/public/* /hedgedoc/realtime /hedgedoc/realtime/*
+handle @backend {
+	uri strip_prefix /hedgedoc
+	reverse_proxy http://backend:3000
+}
+
+# The bare prefix and everything below it go to the Next.js frontend as-is.
+# Next.js answers /hedgedoc directly and redirects /hedgedoc/ -> /hedgedoc
+# itself; adding a redirect for the bare prefix here would cause a loop.
+@frontend path /hedgedoc /hedgedoc/*
+handle @frontend {
+	reverse_proxy http://frontend:3001
+}
+
+# Convenience: visiting the root jumps to the subpath. NOTE: 'redir' cannot
+# be used here - its first argument is always parsed as a matcher, so both
+# 'redir /hedgedoc' and 'redir /hedgedoc 302' misbehave inside a handle.
+handle / {
+	header Location /hedgedoc
+	respond 302
+}
+
+handle {
+	respond 404
+}

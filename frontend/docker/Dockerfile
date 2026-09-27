@@ -18,11 +18,23 @@ RUN apk add --no-cache libc6-compat git
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 
+# The subpath under which HedgeDoc will be served (e.g. /hedgedoc).
+# basePath is baked into the Next.js build, so it must be set here.
+# Leave it empty to serve the app at the domain root.
+ARG NEXT_PUBLIC_BASE_PATH=/hedgedoc
+ENV NEXT_PUBLIC_BASE_PATH=${NEXT_PUBLIC_BASE_PATH}
+
 ENV PNPM_STORE_DIR=/tmp/.pnpm-store
 USER node
 WORKDIR /usr/src/app
 
 COPY --chown=node . .
+
+# Windows checkouts (core.autocrlf=true) carry CRLF line endings, which break
+# shell scripts inside the container ("sh: ./build.sh: not found").
+# Normalize all shell scripts to LF before any build step executes them.
+RUN find . -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
+
 RUN --mount=type=cache,sharing=locked,uid=1000,gid=1000,target=/tmp/.pnpm-store \
     pnpm install --frozen-lockfile --store-dir "$PNPM_STORE_DIR"
 
@@ -32,6 +44,10 @@ RUN pnpm run build --filter=@hedgedoc/frontend --no-cache --no-daemon
 FROM base
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
+
+# Keep the build-time base path also available at runtime (server components).
+ARG NEXT_PUBLIC_BASE_PATH=/hedgedoc
+ENV NEXT_PUBLIC_BASE_PATH=${NEXT_PUBLIC_BASE_PATH}
 
 LABEL org.opencontainers.image.title='HedgeDoc production frontend image'
 LABEL org.opencontainers.image.url='https://hedgedoc.org'

@@ -9,6 +9,7 @@ import { promises as fs } from 'fs';
 import { join } from 'path';
 
 import mediaConfiguration, { MediaConfig } from '../../config/media.config';
+import appConfiguration, { AppConfig } from '../../config/app.config';
 import { MediaBackendError } from '../../errors/errors';
 import { ConsoleLoggerService } from '../../logger/console-logger.service';
 import { MediaBackend } from '../media-backend.interface';
@@ -22,6 +23,8 @@ export class FilesystemBackend implements MediaBackend {
     private readonly logger: ConsoleLoggerService,
     @Inject(mediaConfiguration.KEY)
     private mediaConfig: MediaConfig,
+    @Inject(appConfiguration.KEY)
+    private appConfig: AppConfig,
   ) {
     this.logger.setContext(FilesystemBackend.name);
     // only create the backend if local filesystem is configured
@@ -64,7 +67,11 @@ export class FilesystemBackend implements MediaBackend {
   }
 
   getFileUrl(uuid: string, _: string): Promise<string> {
-    return Promise.resolve(`/media/${uuid}`);
+    // When the app is served under a subpath (HD_BASE_URL contains it),
+    // the generated link has to carry that prefix, otherwise the browser
+    // would request the root path which isn't routed to HedgeDoc.
+    const subPath = new URL(this.appConfig.baseUrl).pathname.replace(/\/+$/, '');
+    return Promise.resolve(`${subPath}/media/${uuid}`);
   }
 
   /**

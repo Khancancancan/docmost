@@ -26,8 +26,11 @@ class MessageService implements OnApplicationBootstrap, OnApplicationShutdown {
     const baseUrl = this.appConfig.baseUrl;
     const port = this.appConfig.backendPort;
 
-    const publicApiDocsURL = new URL(PUBLIC_API_PATH, baseUrl).toString();
-    const privateApiDocsURL = new URL(PRIVATE_API_PATH, baseUrl).toString();
+    // Build absolute paths (starting with /) so the URL constructor keeps an
+    // optional subpath of the base url instead of dropping the last segment.
+    const basePath = new URL(baseUrl).pathname.replace(/\/+$/, '');
+    const publicApiDocsURL = new URL(`${basePath}/${PUBLIC_API_PATH}`, baseUrl).toString();
+    const privateApiDocsURL = new URL(`${basePath}/${PRIVATE_API_PATH}`, baseUrl).toString();
 
     const logo = [
       '',

@@ -1,0 +1,96 @@
+# SPDX-FileCopyrightText: 2026 The HedgeDoc authors (see AUTHORS file)
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# The image is built with NEXT_PUBLIC_BASE_PATH only for the frontend;
+# the backend itself keeps serving root paths and relies on the proxy
+# to strip the /hedgedoc prefix.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: hedgedoc
+  labels:
+    app: hedgedoc-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hedgedoc-backend
+  template:
+    metadata:
+      labels:
+        app: hedgedoc-backend
+    spec:
+      initContainers:
+        - name: wait-for-db
+          image: postgres:15-alpine
+          command:
+            - sh
+            - -c
+            - "until pg_isready -h db -U hedgedoc -d hedgedoc; do echo waiting for db; sleep 2; done"
+      containers:
+        - name: backend
+          # For minikube: build & load the local image:
+          #   docker build -t hedgedoc-backend:dev -f backend/docker/Dockerfile .
+          #   minikube image load hedgedoc-backend:dev
+          # CI replaces this tag with the registry image.
+          image: hedgedoc-backend:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: hedgedoc-env
+            - secretRef:
+                name: hedgedoc-secret
+          volumeMounts:
+            - name: uploads
+              mountPath: /usr/src/app/backend/uploads
+          readinessProbe:
+            httpGet:
+              path: /api/v2/monitoring/health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v2/monitoring/health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: hedgedoc-uploads
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: hedgedoc
+spec:
+  selector:
+    app: hedgedoc-backend
+  ports:
+    - port: 3000
+      targetPort: 3000
+      protocol: TCP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hedgedoc-uploads
+  namespace: hedgedoc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

@@ -1,0 +1,87 @@
+# SPDX-FileCopyrightText: 2026 The HedgeDoc authors (see AUTHORS file)
+# SPDX-License-Identifier: AGPL-3.0-only
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db
+  namespace: hedgedoc
+  labels:
+    app: hedgedoc-db
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: hedgedoc-db
+  template:
+    metadata:
+      labels:
+        app: hedgedoc-db
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: hedgedoc
+            - name: POSTGRES_DB
+              value: hedgedoc
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hedgedoc-secret
+                  key: POSTGRES_PASSWORD
+          volumeMounts:
+            - name: db-data
+              mountPath: /var/lib/postgresql/data
+          # NOTE: kubernetes exec probes run the array directly - there is no
+          # shell, so docker-compose's "CMD-SHELL" form does NOT work here.
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "hedgedoc", "-d", "hedgedoc"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "hedgedoc", "-d", "hedgedoc"]
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        - name: db-data
+          persistentVolumeClaim:
+            claimName: hedgedoc-db-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  namespace: hedgedoc
+spec:
+  selector:
+    app: hedgedoc-db
+  ports:
+    - port: 5432
+      targetPort: 5432
+      protocol: TCP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hedgedoc-db-data
+  namespace: hedgedoc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

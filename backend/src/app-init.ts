@@ -99,8 +99,10 @@ export async function setupApp(
   logger.log('Rate limiting enabled', 'AppBootstrap');
 
   // Enable web security aspects
+  // The configured renderer base url may contain a subpath, but CORS origins
+  // never include a path. Therefore only the origin part is used.
   app.enableCors({
-    origin: appConfig.rendererBaseUrl,
+    origin: new URL(appConfig.rendererBaseUrl).origin,
   });
   logger.log(`Enabling CORS for '${appConfig.rendererBaseUrl}'`, 'AppBootstrap');
   // TODO Add CSP (#1309)

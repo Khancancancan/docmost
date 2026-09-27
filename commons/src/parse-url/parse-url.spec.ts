@@ -34,13 +34,18 @@ describe('validate url', () => {
     it('accepts urls with just domain without trailing slash', () => {
       expect(parseUrl('http://example.org').get().toString()).toEqual('http://example.org/')
     })
-    it('declines urls with with subpath and trailing slash', () => {
-      expect(() => parseUrl('http://example.org/asd/').get().toString()).toThrow(
-        NoSubdirectoryAllowedError,
+    it('accepts urls with a single subpath and trailing slash', () => {
+      expect(parseUrl('http://example.org/hedgedoc/').get().toString()).toEqual(
+        'http://example.org/hedgedoc/',
       )
     })
-    it('declines urls with with subpath and without trailing slash', () => {
-      expect(() => parseUrl('http://example.org/asd').get().toString()).toThrow(
+    it('accepts urls with a single subpath and without trailing slash', () => {
+      expect(parseUrl('http://example.org/hedgedoc').get().toString()).toEqual(
+        'http://example.org/hedgedoc',
+      )
+    })
+    it('declines urls with more than one subpath', () => {
+      expect(() => parseUrl('http://example.org/hedgedoc/foo').get()).toThrow(
         NoSubdirectoryAllowedError,
       )
     })

@@ -6,7 +6,7 @@
 
 export class NoSubdirectoryAllowedError extends Error {
   constructor() {
-    super('Subdirectories are not allowed')
+    super('More than one subdirectory is not allowed')
   }
 }
 

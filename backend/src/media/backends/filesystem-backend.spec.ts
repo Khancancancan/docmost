@@ -9,6 +9,7 @@ import { promises as fs } from 'fs';
 import { Mock } from 'ts-mockery';
 
 import { MediaConfig } from '../../config/media.config';
+import { AppConfig } from '../../config/app.config';
 import { MediaBackendError } from '../../errors/errors';
 import { ConsoleLoggerService } from '../../logger/console-logger.service';
 import { FilesystemBackend } from './filesystem-backend';
@@ -45,10 +46,16 @@ describe('filesystem backend', () => {
     });
   }
 
+  function mockAppConfig(baseUrl = 'http://example.org'): AppConfig {
+    return Mock.of<AppConfig>({
+      baseUrl,
+    });
+  }
+
   let sut: FilesystemBackend;
 
   beforeAll(() => {
-    sut = new FilesystemBackend(mockedLoggerService, mockMediaConfig());
+    sut = new FilesystemBackend(mockedLoggerService, mockMediaConfig(), mockAppConfig());
   });
 
   beforeEach(() => {
@@ -131,6 +138,17 @@ describe('filesystem backend', () => {
   describe('getFileUrl', () => {
     it('returns the public media url for the file', async () => {
       await expect(sut.getFileUrl(mockedUuid, '')).resolves.toBe(`/media/${mockedUuid}`);
+    });
+
+    it('prefixes the media url with the subpath from the base url', async () => {
+      const subPathBackend = new FilesystemBackend(
+        mockedLoggerService,
+        mockMediaConfig(),
+        mockAppConfig('http://example.org/hedgedoc'),
+      );
+      await expect(subPathBackend.getFileUrl(mockedUuid, '')).resolves.toBe(
+        `/hedgedoc/media/${mockedUuid}`,
+      );
     });
   });
 

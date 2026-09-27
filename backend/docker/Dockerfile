@@ -31,6 +31,11 @@ WORKDIR /usr/src/app
 
 COPY --chown=node . .
 
+# Windows checkouts (core.autocrlf=true) carry CRLF line endings, which break
+# shell scripts inside the container ("sh: ./build.sh: not found").
+# Normalize all shell scripts to LF before any build step executes them.
+RUN find . -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
+
 # Install dependencies first to not invalidate the cache on every source change
 RUN --mount=type=cache,sharing=locked,uid=1000,gid=1000,target=/tmp/.pnpm-store \
     pnpm install --frozen-lockfile --store-dir "$PNPM_STORE_DIR"

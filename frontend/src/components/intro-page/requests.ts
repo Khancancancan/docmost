@@ -12,7 +12,8 @@ import { defaultConfig } from '../../api/common/default-config'
  * @throws {Error} if the content can't be fetched
  */
 export const fetchFrontPageContent = async (): Promise<string> => {
-  const response = await fetch('/public/intro.md', {
+  const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? ''
+  const response = await fetch(`${basePath}/public/intro.md`, {
     ...defaultConfig,
     method: 'GET'
   })

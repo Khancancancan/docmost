@@ -56,31 +56,57 @@ describe('BaseUrlFromEnvExtractor', () => {
     expect(() => sut.extractBaseUrls()).toThrow("isn't a valid URL")
   })
 
-  it('should throw if editor base url contains a subdirectory', () => {
-    process.env.HD_BASE_URL = 'https://editor.example.org/asd/'
+  it('should accept a single subpath in editor base url', () => {
+    process.env.HD_BASE_URL = 'https://editor.example.org/hedgedoc'
     process.env.HD_RENDERER_BASE_URL = 'https://renderer.example.org/'
     process.env.HD_INTERNAL_API_URL = 'https://internal.example.org/'
     const sut = new BaseUrlFromEnvExtractor()
 
-    expect(() => sut.extractBaseUrls()).toThrow('Subdirectories are not allowed')
+    expect(sut.extractBaseUrls()).toStrictEqual({
+      renderer: 'https://renderer.example.org/',
+      internalApiUrl: 'https://internal.example.org/',
+      editor: 'https://editor.example.org/hedgedoc/'
+    })
+  })
+
+  it('appends a trailing slash to a single subpath so downstream path joins work', () => {
+    process.env.HD_BASE_URL = 'https://editor.example.org/hedgedoc/'
+    delete process.env.HD_RENDERER_BASE_URL
+    delete process.env.HD_INTERNAL_API_URL
+    const sut = new BaseUrlFromEnvExtractor()
+
+    expect(sut.extractBaseUrls()).toStrictEqual({
+      renderer: 'https://editor.example.org/hedgedoc/',
+      internalApiUrl: undefined,
+      editor: 'https://editor.example.org/hedgedoc/'
+    })
+  })
+
+  it('should throw if editor base url contains more than one subdirectory', () => {
+    process.env.HD_BASE_URL = 'https://editor.example.org/asd/foo'
+    process.env.HD_RENDERER_BASE_URL = 'https://renderer.example.org/'
+    process.env.HD_INTERNAL_API_URL = 'https://internal.example.org/'
+    const sut = new BaseUrlFromEnvExtractor()
+
+    expect(() => sut.extractBaseUrls()).toThrow('More than one subdirectory is not allowed')
   })
 
   it('should throw if renderer base url contains a subdirectory', () => {
     process.env.HD_BASE_URL = 'https://editor.example.org/'
-    process.env.HD_RENDERER_BASE_URL = 'https://renderer.example.org/asd/'
+    process.env.HD_RENDERER_BASE_URL = 'https://renderer.example.org/asd/foo'
     process.env.HD_INTERNAL_API_URL = 'https://internal.example.org/'
     const sut = new BaseUrlFromEnvExtractor()
 
-    expect(() => sut.extractBaseUrls()).toThrow('Subdirectories are not allowed')
+    expect(() => sut.extractBaseUrls()).toThrow('More than one subdirectory is not allowed')
   })
 
   it('should throw if internal api url contains a subdirectory', () => {
     process.env.HD_BASE_URL = 'https://editor.example.org/'
     process.env.HD_RENDERER_BASE_URL = 'https://renderer.example.org/'
-    process.env.HD_INTERNAL_API_URL = 'https://internal.example.org/asd/'
+    process.env.HD_INTERNAL_API_URL = 'https://internal.example.org/asd/foo'
     const sut = new BaseUrlFromEnvExtractor()
 
-    expect(() => sut.extractBaseUrls()).toThrow('Subdirectories are not allowed')
+    expect(() => sut.extractBaseUrls()).toThrow('More than one subdirectory is not allowed')
   })
 
   it('should copy editor base url to renderer base url if url is omitted', () => {

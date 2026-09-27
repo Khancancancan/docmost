@@ -10,9 +10,9 @@ import appConfig from './app.config';
 import { Loglevel } from './loglevel.enum';
 
 describe('appConfig', () => {
-  const baseUrl = 'https://example.com/';
+  const baseUrl = 'https://example.com';
   const invalidBaseUrl = 'localhost';
-  const rendererBaseUrl = 'https://render.example.com/';
+  const rendererBaseUrl = 'https://render.example.com';
   const port = 3333;
   const negativePort = -9000;
   const floatPort = 3.14;
@@ -207,10 +207,10 @@ describe('appConfig', () => {
       restore();
     });
 
-    it('when given a base url with subdirectory in HD_BASE_URL', async () => {
+    it('when given a base url with more than one subdirectory in HD_BASE_URL', async () => {
       const restore = mockedEnv(
         {
-          HD_BASE_URL: 'https://example.org/subdirectory/',
+          HD_BASE_URL: 'https://example.org/subdirectory/foo',
           HD_LOG_LEVEL: loglevel,
           HD_LOG_SHOW_TIMESTAMP: showLogTimestamp.toString(),
         },
@@ -220,9 +220,26 @@ describe('appConfig', () => {
       );
       appConfig();
       expect(spyConsoleError.mock.calls[0][0]).toContain(
-        'HD_BASE_URL: must not contain a subdirectory',
+        'HD_BASE_URL: must not contain more than one subdirectory',
       );
       expect(spyProcessExit).toHaveBeenCalledWith(1);
+      restore();
+    });
+
+    it('accepts a single subdirectory in HD_BASE_URL and strips the trailing slash', async () => {
+      const restore = mockedEnv(
+        {
+          HD_BASE_URL: 'https://example.org/hedgedoc/',
+          HD_LOG_LEVEL: loglevel,
+          HD_LOG_SHOW_TIMESTAMP: showLogTimestamp.toString(),
+        },
+        {
+          clear: true,
+        },
+      );
+      const config = appConfig();
+      expect(config.baseUrl).toEqual('https://example.org/hedgedoc');
+      expect(config.rendererBaseUrl).toEqual('https://example.org/hedgedoc');
       restore();
     });
 

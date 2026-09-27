@@ -12,7 +12,7 @@ import { Optional } from '@mrdrogdrog/optional'
  * @param {String | undefined} url the raw url
  * @return An {@link Optional} that contains the parsed URL or is empty if the raw value isn't a valid URL
  * @throws WrongProtocolError if the protocol of the URL isn't either http nor https
- * @throws NoSubdirectoryAllowedError if the URL has a path that doesn't end with a trailing slash
+ * @throws NoSubdirectoryAllowedError if the URL has more than a single path segment
  */
 export function parseUrl(url: string | undefined): Optional<URL> {
   return createOptionalUrl(url)
@@ -21,7 +21,9 @@ export function parseUrl(url: string | undefined): Optional<URL> {
       () => new WrongProtocolError(),
     )
     .guard(
-      (value) => value.pathname === '/',
+      // Serving the app under exactly one subpath (e.g. https://example.org/hedgedoc)
+      // is supported. Deeper paths (e.g. /foo/bar) are not.
+      (value) => value.pathname === '/' || /^\/[^/]+\/?$/.test(value.pathname),
       () => new NoSubdirectoryAllowedError(),
     )
 }

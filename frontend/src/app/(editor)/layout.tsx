@@ -23,6 +23,8 @@ import { CachedMotdModal } from '../../components/global-dialogs/motd-modal/cach
 
 configureLuxon()
 
+const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? ''
+
 interface RootLayoutProps extends PropsWithChildren {
   appBar: React.ReactNode
 }
@@ -35,7 +37,7 @@ export default async function RootLayout({ children, appBar }: RootLayoutProps) 
   return (
     <html lang='en'>
       <head>
-        <link color='#b51f08' href='/icons/safari-pinned-tab.svg' rel='mask-icon' />
+        <link color='#b51f08' href={`${basePath}/icons/safari-pinned-tab.svg`} rel='mask-icon' />
       </head>
       <body>
         <ExpectedOriginBoundary expectedOrigin={baseUrls.editor}>
@@ -70,7 +72,7 @@ export const metadata: Metadata = {
   },
   description: 'HedgeDoc - Ideas grow better together',
   title: 'HedgeDoc',
-  manifest: '/icons/site.webmanifest'
+  manifest: `${basePath}/icons/site.webmanifest`
 }
 
 export const viewport: Viewport = {

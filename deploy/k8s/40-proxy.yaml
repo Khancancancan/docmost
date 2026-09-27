@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: 2026 The HedgeDoc authors (see AUTHORS file)
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Caddy is the in-cluster entry point. It strips /hedgedoc for backend
+# requests and keeps it for the Next.js frontend. The ingress only routes
+# the /hedgedoc path to this service (no rewrite there).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxy
+  namespace: hedgedoc
+  labels:
+    app: hedgedoc-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hedgedoc-proxy
+  template:
+    metadata:
+      labels:
+        app: hedgedoc-proxy
+    spec:
+      containers:
+        - name: caddy
+          image: caddy:2
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: caddyfile
+              mountPath: /etc/caddy/Caddyfile
+              subPath: Caddyfile
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "25m"
+              memory: "32Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+      volumes:
+        - name: caddyfile
+          configMap:
+            name: hedgedoc-proxy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxy
+  namespace: hedgedoc
+spec:
+  selector:
+    app: hedgedoc-proxy
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP

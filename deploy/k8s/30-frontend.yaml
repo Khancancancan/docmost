@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: 2026 The HedgeDoc authors (see AUTHORS file)
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# The frontend image is built with build-arg NEXT_PUBLIC_BASE_PATH=/hedgedoc,
+# therefore Next.js expects requests to already contain the /hedgedoc prefix
+# (the proxy forwards them unchanged).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: hedgedoc
+  labels:
+    app: hedgedoc-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hedgedoc-frontend
+  template:
+    metadata:
+      labels:
+        app: hedgedoc-frontend
+    spec:
+      containers:
+        - name: frontend
+          # For minikube: build & load the local image:
+          #   docker build -t hedgedoc-frontend:dev \
+          #     --build-arg NEXT_PUBLIC_BASE_PATH=/hedgedoc \
+          #     -f frontend/docker/Dockerfile .
+          #   minikube image load hedgedoc-frontend:dev
+          image: hedgedoc-frontend:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3001
+          envFrom:
+            - configMapRef:
+                name: hedgedoc-env
+          readinessProbe:
+            tcpSocket:
+              port: 3001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: hedgedoc
+spec:
+  selector:
+    app: hedgedoc-frontend
+  ports:
+    - port: 3001
+      targetPort: 3001
+      protocol: TCP

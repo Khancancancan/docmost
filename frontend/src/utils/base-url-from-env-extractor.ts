@@ -34,11 +34,30 @@ export class BaseUrlFromEnvExtractor {
     return this.extractUrlFromEnvVar(process.env[envVarName])
   }
 
+  /**
+   * Ensures the URL path ends with a slash. Many call sites append paths
+   * directly (`${baseUrl}public/motd.md`, `pathname += 'realtime'`) or resolve
+   * relative URLs against the base. Those only work when the path has a
+   * trailing slash; with a subpath and no trailing slash they produce
+   * "/hedgedocrealtime" or drop the subpath segment entirely.
+   */
+  private withTrailingSlash(url: URL): URL {
+    if (!url.pathname.endsWith('/')) {
+      url.pathname += '/'
+    }
+    return url
+  }
+
   private renewBaseUrls(): BaseUrls {
     return this.extractUrlFromEnvVar(process.env.HD_BASE_URL)
-      .map((editorBaseUrl) => {
-        const rendererBaseUrl = this.extractUrlFromEnv('HD_RENDERER_BASE_URL').orElse(editorBaseUrl)
-        const internalApiUrl = this.extractUrlFromEnv('HD_INTERNAL_API_URL').orElse(undefined)
+      .map((rawEditorBaseUrl) => {
+        const editorBaseUrl = this.withTrailingSlash(rawEditorBaseUrl)
+        const rendererBaseUrl = this.withTrailingSlash(
+          this.extractUrlFromEnv('HD_RENDERER_BASE_URL').orElse(editorBaseUrl),
+        )
+        const internalApiUrl = this.extractUrlFromEnv('HD_INTERNAL_API_URL')
+          .map((url) => this.withTrailingSlash(url))
+          .orElse(undefined)
         return {
           editor: editorBaseUrl.toString(),
           renderer: rendererBaseUrl.toString(),

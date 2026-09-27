@@ -35,7 +35,7 @@ function validateUrl(value: string | undefined, ctx: RefinementCtx): void {
     if (error instanceof NoSubdirectoryAllowedError) {
       ctx.issues.push({
         code: 'invalid_format',
-        message: 'must not contain a subdirectory',
+        message: 'must not contain more than one subdirectory',
         input: value,
         format: 'url',
       });
@@ -74,9 +74,15 @@ const schema = z
     }),
   })
   .transform((data) => {
+    // Normalize away trailing slashes. Several places concatenate paths onto
+    // baseUrl (e.g. `${baseUrl}/api/...`), which would produce a double slash
+    // when the app is served under a subpath with a trailing slash configured.
+    data.baseUrl = data.baseUrl.replace(/\/+$/, '');
     // Handle the default reference for rendererBaseUrl
     if (data.rendererBaseUrl === '') {
       data.rendererBaseUrl = data.baseUrl;
+    } else {
+      data.rendererBaseUrl = data.rendererBaseUrl.replace(/\/+$/, '');
     }
     return data;
   });

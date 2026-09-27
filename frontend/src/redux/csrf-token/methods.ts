@@ -40,7 +40,8 @@ export async function refreshCsrfToken(): Promise<void> {
   if (typeof window === 'undefined') {
     return
   }
-  const response = await fetch('/api/private/csrf/token', {
+  const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? ''
+  const response = await fetch(`${basePath}/api/private/csrf/token`, {
     method: 'GET',
     credentials: 'same-origin'
   })

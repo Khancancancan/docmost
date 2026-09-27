@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: 2026 The HedgeDoc authors (see AUTHORS file)
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Non-secret configuration for the HedgeDoc workloads.
+# HD_BASE_URL MUST be the externally visible URL including the subpath
+# (without trailing slash). In minikube with a port-forward to 20866 this is
+# http://localhost:20866/hedgedoc ; on the work cluster replace host/protocol
+# accordingly (the .gitlab-ci.yml overwrites this ConfigMap on deploy).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hedgedoc-env
+  namespace: hedgedoc
+data:
+  HD_BASE_URL: "http://localhost:20866/hedgedoc"
+  HD_INTERNAL_API_URL: "http://backend:3000/"
+  HD_BACKEND_BIND_IP: "0.0.0.0"
+  HD_DATABASE_TYPE: "postgres"
+  HD_DATABASE_HOST: "db"
+  HD_DATABASE_PORT: "5432"
+  HD_DATABASE_NAME: "hedgedoc"
+  HD_DATABASE_USERNAME: "hedgedoc"
+  HD_AUTH_LOCAL_ENABLE_LOGIN: "true"
+  HD_AUTH_LOCAL_ENABLE_REGISTER: "true"
+  HD_NOTE_PERMISSIONS_MAX_GUEST_LEVEL: "write"
+  HD_MEDIA_BACKEND_TYPE: "filesystem"
+  HD_MEDIA_BACKEND_FILESYSTEM_UPLOAD_PATH: "uploads/"
+---
+# Same Caddyfile as docker/Caddyfile - service names "backend" and "frontend"
+# are the Kubernetes Services in this namespace, so no path changes are needed.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hedgedoc-proxy-config
+  namespace: hedgedoc
+data:
+  Caddyfile: |
+    # Trust the nginx ingress (pod IPs are in private ranges) so that the
+    # external scheme/host it provides are preserved instead of being
+    # overwritten with Caddy's plain-HTTP internal hop.
+    {
+    	servers {
+    		trusted_proxies static private_ranges
+    	}
+    }
+
+    :80
+
+    log {
+    	output stdout
+    	level WARN
+    	format console
+    }
+
+    # Do NOT set X-Forwarded-Host manually: Caddy's {host} placeholder omits
+    # the port; the automatic header keeps/preserves the full host.
+    @backend path /hedgedoc/api/* /hedgedoc/media/* /hedgedoc/public/* /hedgedoc/realtime /hedgedoc/realtime/*
+    handle @backend {
+    	uri strip_prefix /hedgedoc
+    	reverse_proxy http://backend:3000
+    }
+
+    # The bare prefix and everything below it go to the Next.js frontend as-is.
+    # Next.js answers /hedgedoc directly and redirects /hedgedoc/ -> /hedgedoc
+    # itself; adding a redirect for the bare prefix here would cause a loop.
+    @frontend path /hedgedoc /hedgedoc/*
+    handle @frontend {
+    	reverse_proxy http://frontend:3001
+    }
+
+    # 'redir' cannot be used here - its first argument is always parsed as a
+    # matcher, so both 'redir /hedgedoc' and 'redir /hedgedoc 302' misbehave.
+    handle / {
+    	header Location /hedgedoc
+    	respond 302
+    }
+
+    handle {
+    	respond 404
+    }

@@ -1,38 +1,85 @@
-# SPDX-FileCopyrightText: 2023 The HedgeDoc developers (see AUTHORS file)
+# SPDX-FileCopyrightText: 2023 The HedgeDoc authors (see AUTHORS file)
 # SPDX-License-Identifier: AGPL-3.0-only
+#
+# Local test setup serving HedgeDoc under http://localhost:20866/hedgedoc/
+#
+#   docker compose -f docker/docker-compose.yml up -d --build
+#
+# Images are built from this repository (not pulled) so that the local
+# subpath changes take effect. The frontend build bakes in the
+# NEXT_PUBLIC_BASE_PATH build argument.
 ---
+x-hedgedoc-base-url: &hedgedoc_base_url ${HD_BASE_URL:-http://localhost:20866/hedgedoc}
+
 services:
   backend:
-    image: ghcr.io/hedgedoc/hedgedoc/backend:develop
+    build:
+      context: ..
+      dockerfile: backend/docker/Dockerfile
+    image: hedgedoc-backend:dev
+    environment:
+      # No trailing slash: the backend concatenates paths on it.
+      HD_BASE_URL: *hedgedoc_base_url
+      HD_BACKEND_BIND_IP: "0.0.0.0"
+      HD_DATABASE_TYPE: postgres
+      HD_DATABASE_HOST: db
+      HD_DATABASE_PORT: "5432"
+      HD_DATABASE_NAME: ${HD_DATABASE_NAME:-hedgedoc}
+      HD_DATABASE_USERNAME: ${HD_DATABASE_USERNAME:-hedgedoc}
+      HD_DATABASE_PASSWORD: ${HD_DATABASE_PASSWORD:-hedgedoc}
+      HD_AUTH_SESSION_SECRET: ${HD_AUTH_SESSION_SECRET:-local-development-session-secret-change-me-0001}
+      HD_AUTH_LOCAL_ENABLE_LOGIN: "true"
+      HD_AUTH_LOCAL_ENABLE_REGISTER: "true"
+      HD_NOTE_PERMISSIONS_MAX_GUEST_LEVEL: write
+      HD_MEDIA_BACKEND_TYPE: filesystem
+      HD_MEDIA_BACKEND_FILESYSTEM_UPLOAD_PATH: uploads/
     volumes:
-      - ./.env:/usr/src/app/backend/.env
       - hedgedoc_uploads:/usr/src/app/backend/uploads
+    depends_on:
+      db:
+        condition: service_healthy
 
   frontend:
-    image: ghcr.io/hedgedoc/hedgedoc/frontend:develop
+    build:
+      context: ..
+      dockerfile: frontend/docker/Dockerfile
+      args:
+        # Baked into the Next.js build; change together with the prefix in Caddyfile.
+        NEXT_PUBLIC_BASE_PATH: ${NEXT_PUBLIC_BASE_PATH:-/hedgedoc}
+    image: hedgedoc-frontend:dev
     environment:
-      HD_BASE_URL: "${HD_BASE_URL}"
+      HD_BASE_URL: *hedgedoc_base_url
+      # Server-side rendering calls the backend directly inside the network.
+      HD_INTERNAL_API_URL: http://backend:3000/
 
   db:
     image: postgres:15
     environment:
-      POSTGRES_USER: "${HD_DATABASE_USERNAME}"
-      POSTGRES_PASSWORD: "${HD_DATABASE_PASSWORD}"
-      POSTGRES_DB: "${HD_DATABASE_NAME}"
+      POSTGRES_USER: ${HD_DATABASE_USERNAME:-hedgedoc}
+      POSTGRES_PASSWORD: ${HD_DATABASE_PASSWORD:-hedgedoc}
+      POSTGRES_DB: ${HD_DATABASE_NAME:-hedgedoc}
+    volumes:
+      - hedgedoc_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${HD_DATABASE_USERNAME:-hedgedoc} -d ${HD_DATABASE_NAME:-hedgedoc}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   proxy:
-    image: caddy:latest
+    image: caddy:2
     restart: unless-stopped
-    environment:
-      HD_BASE_URL: "${HD_BASE_URL}"
     ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
+      # Open http://localhost:20866/hedgedoc/
+      - "20866:80"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
+    depends_on:
+      - backend
+      - frontend
 
 volumes:
   hedgedoc_uploads:
+  hedgedoc_db_data:
   caddy_data:

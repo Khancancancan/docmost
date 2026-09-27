@@ -1,0 +1,1398 @@
+diff --git a/.gitlab-ci.yml b/.gitlab-ci.yml
+new file mode 100644
+index 000000000..bdbf1cfe3
+--- /dev/null
++++ b/.gitlab-ci.yml
+@@ -0,0 +1,100 @@
++# SPDX-FileCopyrightText: 2026 The HedgeDoc authors (see AUTHORS file)
++# SPDX-License-Identifier: AGPL-3.0-only
++#
++# Pipeline for the /hedgedoc subpath build.
++#
++# Required GitLab CI/CD variables (Settings -> CI/CD -> Variables):
++#   KUBE_CONFIG  kubeconfig of a service account that can manage the
++#                "hedgedoc" namespace on the work cluster
++#   HD_BASE_URL  external URL incl. subpath, e.g. https://notes.example.com/hedgedoc
++#
++# The GitLab built-in variables CI_REGISTRY / CI_REGISTRY_IMAGE /
++# CI_REGISTRY_USER / CI_REGISTRY_PASSWORD are used automatically.
++# Docker-in-Docker jobs require a runner with the "privileged" mode enabled.
++
++stages:
++  - build
++  - deploy
++
++variables:
++  BASE_PATH: "/hedgedoc"
++  DEPLOY_NAMESPACE: "hedgedoc"
++  DOCKER_TLS_CERTDIR: ""
++  DOCKER_HOST: tcp://docker:2375
++  DOCKER_BUILDKIT: "1"
++
++# ---------------------------------------------------------------------------
++# Build the two application images from this repository. The frontend build
++# bakes in NEXT_PUBLIC_BASE_PATH=${BASE_PATH}.
++# ---------------------------------------------------------------------------
++
++build:backend:
++  stage: build
++  image: docker:27
++  services:
++    - docker:27-dind
++  rules:
++    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
++  before_script:
++    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
++  script:
++    - docker build
++      -f backend/docker/Dockerfile
++      -t "$CI_REGISTRY_IMAGE/backend:$CI_COMMIT_SHA"
++      -t "$CI_REGISTRY_IMAGE/backend:latest"
++      .
++    - docker push "$CI_REGISTRY_IMAGE/backend:$CI_COMMIT_SHA"
++    - docker push "$CI_REGISTRY_IMAGE/backend:latest"
++
++build:frontend:
++  stage: build
++  image: docker:27
++  services:
++    - docker:27-dind
++  rules:
++    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
++  before_script:
++    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
++  script:
++    - docker build
++      --build-arg NEXT_PUBLIC_BASE_PATH=$BASE_PATH
++      -f frontend/docker/Dockerfile
++      -t "$CI_REGISTRY_IMAGE/frontend:$CI_COMMIT_SHA"
++      -t "$CI_REGISTRY_IMAGE/frontend:latest"
++      .
++    - docker push "$CI_REGISTRY_IMAGE/frontend:$CI_COMMIT_SHA"
++    - docker push "$CI_REGISTRY_IMAGE/frontend:latest"
++
++# ---------------------------------------------------------------------------
++# Deploy manifests and roll the new images out.
++# Manifests live in deploy/k8s (namespace, configmap, secret, postgres,
++# backend, frontend, caddy proxy, ingress).
++# ---------------------------------------------------------------------------
++
++deploy:production:
++  stage: deploy
++  image: bitnami/kubectl:1.31
++  dependencies: []
++  rules:
++    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
++  before_script:
++    - test -n "$KUBE_CONFIG" || (echo "KUBE_CONFIG variable is required" && exit 1)
++    - test -n "$HD_BASE_URL" || (echo "HD_BASE_URL variable is required" && exit 1)
++    - mkdir -p "$HOME/.kube"
++    - echo "$KUBE_CONFIG" > "$HOME/.kube/config"
++  script:
++    - kubectl apply -f deploy/k8s
++    # Point the application to the real external URL (checked-in default is
++    # the local minikube URL). Other ConfigMap keys stay untouched.
++    - kubectl -n "$DEPLOY_NAMESPACE" patch configmap hedgedoc-env --type merge
++      -p "{\"data\":{\"HD_BASE_URL\":\"$HD_BASE_URL\"}}"
++    # Roll out the freshly built images.
++    - kubectl -n "$DEPLOY_NAMESPACE" set image deployment/backend
++      backend="$CI_REGISTRY_IMAGE/backend:$CI_COMMIT_SHA"
++    - kubectl -n "$DEPLOY_NAMESPACE" set image deployment/frontend
++      frontend="$CI_REGISTRY_IMAGE/frontend:$CI_COMMIT_SHA"
++    - kubectl -n "$DEPLOY_NAMESPACE" rollout status deployment/db --timeout=180s
++    - kubectl -n "$DEPLOY_NAMESPACE" rollout status deployment/backend --timeout=180s
++    - kubectl -n "$DEPLOY_NAMESPACE" rollout status deployment/frontend --timeout=180s
++    - kubectl -n "$DEPLOY_NAMESPACE" rollout restart deployment/proxy
++    - kubectl -n "$DEPLOY_NAMESPACE" rollout status deployment/proxy --timeout=180s
+diff --git a/backend/docker/Dockerfile b/backend/docker/Dockerfile
+index 1574714a0..522ee399f 100644
+--- a/backend/docker/Dockerfile
++++ b/backend/docker/Dockerfile
+@@ -31,6 +31,11 @@ WORKDIR /usr/src/app
+ 
+ COPY --chown=node . .
+ 
++# Windows checkouts (core.autocrlf=true) carry CRLF line endings, which break
++# shell scripts inside the container ("sh: ./build.sh: not found").
++# Normalize all shell scripts to LF before any build step executes them.
++RUN find . -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
++
+ # Install dependencies first to not invalidate the cache on every source change
+ RUN --mount=type=cache,sharing=locked,uid=1000,gid=1000,target=/tmp/.pnpm-store \
+     pnpm install --frozen-lockfile --store-dir "$PNPM_STORE_DIR"
+diff --git a/backend/src/app-init.ts b/backend/src/app-init.ts
+index 5bcc15b37..0abe5e03a 100644
+--- a/backend/src/app-init.ts
++++ b/backend/src/app-init.ts
+@@ -99,8 +99,10 @@ export async function setupApp(
+   logger.log('Rate limiting enabled', 'AppBootstrap');
+ 
+   // Enable web security aspects
++  // The configured renderer base url may contain a subpath, but CORS origins
++  // never include a path. Therefore only the origin part is used.
+   app.enableCors({
+-    origin: appConfig.rendererBaseUrl,
++    origin: new URL(appConfig.rendererBaseUrl).origin,
+   });
+   logger.log(`Enabling CORS for '${appConfig.rendererBaseUrl}'`, 'AppBootstrap');
+   // TODO Add CSP (#1309)
+diff --git a/backend/src/config/app.config.spec.ts b/backend/src/config/app.config.spec.ts
+index 0ca2936c3..f67f2bddb 100644
+--- a/backend/src/config/app.config.spec.ts
++++ b/backend/src/config/app.config.spec.ts
+@@ -10,9 +10,9 @@ import appConfig from './app.config';
+ import { Loglevel } from './loglevel.enum';
+ 
+ describe('appConfig', () => {
+-  const baseUrl = 'https://example.com/';
++  const baseUrl = 'https://example.com';
+   const invalidBaseUrl = 'localhost';
+-  const rendererBaseUrl = 'https://render.example.com/';
++  const rendererBaseUrl = 'https://render.example.com';
+   const port = 3333;
+   const negativePort = -9000;
+   const floatPort = 3.14;
+@@ -207,10 +207,10 @@ describe('appConfig', () => {
+       restore();
+     });
+ 
+-    it('when given a base url with subdirectory in HD_BASE_URL', async () => {
++    it('when given a base url with more than one subdirectory in HD_BASE_URL', async () => {
+       const restore = mockedEnv(
+         {
+-          HD_BASE_URL: 'https://example.org/subdirectory/',
++          HD_BASE_URL: 'https://example.org/subdirectory/foo',
+           HD_LOG_LEVEL: loglevel,
+           HD_LOG_SHOW_TIMESTAMP: showLogTimestamp.toString(),
+         },
+@@ -220,12 +220,29 @@ describe('appConfig', () => {
+       );
+       appConfig();
+       expect(spyConsoleError.mock.calls[0][0]).toContain(
+-        'HD_BASE_URL: must not contain a subdirectory',
++        'HD_BASE_URL: must not contain more than one subdirectory',
+       );
+       expect(spyProcessExit).toHaveBeenCalledWith(1);
+       restore();
+     });
+ 
++    it('accepts a single subdirectory in HD_BASE_URL and strips the trailing slash', async () => {
++      const restore = mockedEnv(
++        {
++          HD_BASE_URL: 'https://example.org/hedgedoc/',
++          HD_LOG_LEVEL: loglevel,
++          HD_LOG_SHOW_TIMESTAMP: showLogTimestamp.toString(),
++        },
++        {
++          clear: true,
++        },
++      );
++      const config = appConfig();
++      expect(config.baseUrl).toEqual('https://example.org/hedgedoc');
++      expect(config.rendererBaseUrl).toEqual('https://example.org/hedgedoc');
++      restore();
++    });
++
+     it('when given a negative PORT', async () => {
+       const restore = mockedEnv(
+         {
+diff --git a/backend/src/config/app.config.ts b/backend/src/config/app.config.ts
+index 2c3b54af7..dca84a0b1 100644
+--- a/backend/src/config/app.config.ts
++++ b/backend/src/config/app.config.ts
+@@ -35,7 +35,7 @@ function validateUrl(value: string | undefined, ctx: RefinementCtx): void {
+     if (error instanceof NoSubdirectoryAllowedError) {
+       ctx.issues.push({
+         code: 'invalid_format',
+-        message: 'must not contain a subdirectory',
++        message: 'must not contain more than one subdirectory',
+         input: value,
+         format: 'url',
+       });
+@@ -74,9 +74,15 @@ const schema = z
+     }),
+   })
+   .transform((data) => {
++    // Normalize away trailing slashes. Several places concatenate paths onto
++    // baseUrl (e.g. `${baseUrl}/api/...`), which would produce a double slash
++    // when the app is served under a subpath with a trailing slash configured.
++    data.baseUrl = data.baseUrl.replace(/\/+$/, '');
+     // Handle the default reference for rendererBaseUrl
+     if (data.rendererBaseUrl === '') {
+       data.rendererBaseUrl = data.baseUrl;
++    } else {
++      data.rendererBaseUrl = data.rendererBaseUrl.replace(/\/+$/, '');
+     }
+     return data;
+   });
+diff --git a/backend/src/media/backends/filesystem-backend.spec.ts b/backend/src/media/backends/filesystem-backend.spec.ts
+index a4dbd2d02..15a9710bb 100644
+--- a/backend/src/media/backends/filesystem-backend.spec.ts
++++ b/backend/src/media/backends/filesystem-backend.spec.ts
+@@ -9,6 +9,7 @@ import { promises as fs } from 'fs';
+ import { Mock } from 'ts-mockery';
+ 
+ import { MediaConfig } from '../../config/media.config';
++import { AppConfig } from '../../config/app.config';
+ import { MediaBackendError } from '../../errors/errors';
+ import { ConsoleLoggerService } from '../../logger/console-logger.service';
+ import { FilesystemBackend } from './filesystem-backend';
+@@ -45,10 +46,16 @@ describe('filesystem backend', () => {
+     });
+   }
+ 
++  function mockAppConfig(baseUrl = 'http://example.org'): AppConfig {
++    return Mock.of<AppConfig>({
++      baseUrl,
++    });
++  }
++
+   let sut: FilesystemBackend;
+ 
+   beforeAll(() => {
+-    sut = new FilesystemBackend(mockedLoggerService, mockMediaConfig());
++    sut = new FilesystemBackend(mockedLoggerService, mockMediaConfig(), mockAppConfig());
+   });
+ 
+   beforeEach(() => {
+@@ -132,6 +139,17 @@ describe('filesystem backend', () => {
+     it('returns the public media url for the file', async () => {
+       await expect(sut.getFileUrl(mockedUuid, '')).resolves.toBe(`/media/${mockedUuid}`);
+     });
++
++    it('prefixes the media url with the subpath from the base url', async () => {
++      const subPathBackend = new FilesystemBackend(
++        mockedLoggerService,
++        mockMediaConfig(),
++        mockAppConfig('http://example.org/hedgedoc'),
++      );
++      await expect(subPathBackend.getFileUrl(mockedUuid, '')).resolves.toBe(
++        `/hedgedoc/media/${mockedUuid}`,
++      );
++    });
+   });
+ 
+   describe('getFileResponse', () => {
+diff --git a/backend/src/media/backends/filesystem-backend.ts b/backend/src/media/backends/filesystem-backend.ts
+index 3bd258e77..322cc83ad 100644
+--- a/backend/src/media/backends/filesystem-backend.ts
++++ b/backend/src/media/backends/filesystem-backend.ts
+@@ -9,6 +9,7 @@ import { promises as fs } from 'fs';
+ import { join } from 'path';
+ 
+ import mediaConfiguration, { MediaConfig } from '../../config/media.config';
++import appConfiguration, { AppConfig } from '../../config/app.config';
+ import { MediaBackendError } from '../../errors/errors';
+ import { ConsoleLoggerService } from '../../logger/console-logger.service';
+ import { MediaBackend } from '../media-backend.interface';
+@@ -22,6 +23,8 @@ export class FilesystemBackend implements MediaBackend {
+     private readonly logger: ConsoleLoggerService,
+     @Inject(mediaConfiguration.KEY)
+     private mediaConfig: MediaConfig,
++    @Inject(appConfiguration.KEY)
++    private appConfig: AppConfig,
+   ) {
+     this.logger.setContext(FilesystemBackend.name);
+     // only create the backend if local filesystem is configured
+@@ -64,7 +67,11 @@ export class FilesystemBackend implements MediaBackend {
+   }
+ 
+   getFileUrl(uuid: string, _: string): Promise<string> {
+-    return Promise.resolve(`/media/${uuid}`);
++    // When the app is served under a subpath (HD_BASE_URL contains it),
++    // the generated link has to carry that prefix, otherwise the browser
++    // would request the root path which isn't routed to HedgeDoc.
++    const subPath = new URL(this.appConfig.baseUrl).pathname.replace(/\/+$/, '');
++    return Promise.resolve(`${subPath}/media/${uuid}`);
+   }
+ 
+   /**
+diff --git a/backend/src/message/message.service.ts b/backend/src/message/message.service.ts
+index 92bafba60..c8861a4a7 100644
+--- a/backend/src/message/message.service.ts
++++ b/backend/src/message/message.service.ts
+@@ -26,8 +26,11 @@ class MessageService implements OnApplicationBootstrap, OnApplicationShutdown {
+     const baseUrl = this.appConfig.baseUrl;
+     const port = this.appConfig.backendPort;
+ 
+-    const publicApiDocsURL = new URL(PUBLIC_API_PATH, baseUrl).toString();
+-    const privateApiDocsURL = new URL(PRIVATE_API_PATH, baseUrl).toString();
++    // Build absolute paths (starting with /) so the URL constructor keeps an
++    // optional subpath of the base url instead of dropping the last segment.
++    const basePath = new URL(baseUrl).pathname.replace(/\/+$/, '');
++    const publicApiDocsURL = new URL(`${basePath}/${PUBLIC_API_PATH}`, baseUrl).toString();
++    const privateApiDocsURL = new URL(`${basePath}/${PRIVATE_API_PATH}`, baseUrl).toString();
+ 
+     const logo = [
+       '',
+diff --git a/commons/src/parse-url/errors.ts b/commons/src/parse-url/errors.ts
+index 3a8079bde..d4e5a6741 100644
+--- a/commons/src/parse-url/errors.ts
++++ b/commons/src/parse-url/errors.ts
+@@ -6,7 +6,7 @@
+ 
+ export class NoSubdirectoryAllowedError extends Error {
+   constructor() {
+-    super('Subdirectories are not allowed')
++    super('More than one subdirectory is not allowed')
+   }
+ }
+ 
+diff --git a/commons/src/parse-url/parse-url.spec.ts b/commons/src/parse-url/parse-url.spec.ts
+index a65060460..068024f3a 100644
+--- a/commons/src/parse-url/parse-url.spec.ts
++++ b/commons/src/parse-url/parse-url.spec.ts
+@@ -34,13 +34,18 @@ describe('validate url', () => {
+     it('accepts urls with just domain without trailing slash', () => {
+       expect(parseUrl('http://example.org').get().toString()).toEqual('http://example.org/')
+     })
+-    it('declines urls with with subpath and trailing slash', () => {
+-      expect(() => parseUrl('http://example.org/asd/').get().toString()).toThrow(
+-        NoSubdirectoryAllowedError,
++    it('accepts urls with a single subpath and trailing slash', () => {
++      expect(parseUrl('http://example.org/hedgedoc/').get().toString()).toEqual(
++        'http://example.org/hedgedoc/',
++      )
++    })
++    it('accepts urls with a single subpath and without trailing slash', () => {
++      expect(parseUrl('http://example.org/hedgedoc').get().toString()).toEqual(
++        'http://example.org/hedgedoc',
+       )
+     })
+-    it('declines urls with with subpath and without trailing slash', () => {
+-      expect(() => parseUrl('http://example.org/asd').get().toString()).toThrow(
++    it('declines urls with more than one subpath', () => {
++      expect(() => parseUrl('http://example.org/hedgedoc/foo').get()).toThrow(
+         NoSubdirectoryAllowedError,
+       )
+     })
+diff --git a/commons/src/parse-url/parse-url.ts b/commons/src/parse-url/parse-url.ts
+index 29ba600fb..1cc4a6cca 100644
+--- a/commons/src/parse-url/parse-url.ts
++++ b/commons/src/parse-url/parse-url.ts
+@@ -12,7 +12,7 @@ import { Optional } from '@mrdrogdrog/optional'
+  * @param {String | undefined} url the raw url
+  * @return An {@link Optional} that contains the parsed URL or is empty if the raw value isn't a valid URL
+  * @throws WrongProtocolError if the protocol of the URL isn't either http nor https
+- * @throws NoSubdirectoryAllowedError if the URL has a path that doesn't end with a trailing slash
++ * @throws NoSubdirectoryAllowedError if the URL has more than a single path segment
+  */
+ export function parseUrl(url: string | undefined): Optional<URL> {
+   return createOptionalUrl(url)
+@@ -21,7 +21,9 @@ export function parseUrl(url: string | undefined): Optional<URL> {
+       () => new WrongProtocolError(),
+     )
+     .guard(
+-      (value) => value.pathname === '/',
++      // Serving the app under exactly one subpath (e.g. https://example.org/hedgedoc)
++      // is supported. Deeper paths (e.g. /foo/bar) are not.
++      (value) => value.pathname === '/' || /^\/[^/]+\/?$/.test(value.pathname),
+       () => new NoSubdirectoryAllowedError(),
+     )
+ }
+diff --git a/deploy/k8s/00-namespace.yaml b/deploy/k8s/00-namespace.yaml
+new file mode 100644
+index 000000000..f1d89e539
+--- /dev/null
++++ b/deploy/k8s/00-namespace.yaml
+@@ -0,0 +1,6 @@
++# SPDX-FileCopyrightText: 2026 The HedgeDoc authors (see AUTHORS file)
++# SPDX-License-Identifier: AGPL-3.0-only
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: hedgedoc
+diff --git a/deploy/k8s/01-configmap.yaml b/deploy/k8s/01-configmap.yaml
+new file mode 100644
+index 000000000..e58277f8d
+--- /dev/null
++++ b/deploy/k8s/01-configmap.yaml
+@@ -0,0 +1,80 @@
++# SPDX-FileCopyrightText: 2026 The HedgeDoc authors (see AUTHORS file)
++# SPDX-License-Identifier: AGPL-3.0-only
++#
++# Non-secret configuration for the HedgeDoc workloads.
++# HD_BASE_URL MUST be the externally visible URL including the subpath
++# (without trailing slash). In minikube with a port-forward to 20866 this is
++# http://localhost:20866/hedgedoc ; on the work cluster replace host/protocol
++# accordingly (the .gitlab-ci.yml overwrites this ConfigMap on deploy).
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: hedgedoc-env
++  namespace: hedgedoc
++data:
++  HD_BASE_URL: "http://localhost:20866/hedgedoc"
++  HD_INTERNAL_API_URL: "http://backend:3000/"
++  HD_BACKEND_BIND_IP: "0.0.0.0"
++  HD_DATABASE_TYPE: "postgres"
++  HD_DATABASE_HOST: "db"
++  HD_DATABASE_PORT: "5432"
++  HD_DATABASE_NAME: "hedgedoc"
++  HD_DATABASE_USERNAME: "hedgedoc"
++  HD_AUTH_LOCAL_ENABLE_LOGIN: "true"
++  HD_AUTH_LOCAL_ENABLE_REGISTER: "true"
++  HD_NOTE_PERMISSIONS_MAX_GUEST_LEVEL: "write"
++  HD_MEDIA_BACKEND_TYPE: "filesystem"
++  HD_MEDIA_BACKEND_FILESYSTEM_UPLOAD_PATH: "uploads/"
++---
++# Same Caddyfile as docker/Caddyfile - service names "backend" and "frontend"
++# are the Kubernetes Services in this namespace, so no path changes are needed.
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: hedgedoc-proxy-config
++  namespace: hedgedoc
++data:
++  Caddyfile: |
++    # Trust the nginx ingress (pod IPs are in private ranges) so that the
++    # external scheme/host it provides are preserved instead of being
++    # overwritten with Caddy's plain-HTTP internal hop.
++    {
++    	servers {
++    		trusted_proxies static private_ranges
++    	}
++    }
++
++    :80
++
++    log {
++    	output stdout
++    	level WARN
++    	format console
++    }
++
++    # Do NOT set X-Forwarded-Host manually: Caddy's {host} placeholder omits
++    # the port; the automatic header keeps/preserves the full host.
++    @backend path /hedgedoc/api/* /hedgedoc/media/* /hedgedoc/public/* /hedgedoc/realtime /hedgedoc/realtime/*
++    handle @backend {
++    	uri strip_prefix /hedgedoc
++    	reverse_proxy http://backend:3000
++    }
++
++    # The bare prefix and everything below it go to the Next.js frontend as-is.
++    # Next.js answers /hedgedoc directly and redirects /hedgedoc/ -> /hedgedoc
++    # itself; adding a redirect for the bare prefix here would cause a loop.
++    @frontend path /hedgedoc /hedgedoc/*
++    handle @frontend {
++    	reverse_proxy http://frontend:3001
++    }
++
++    # 'redir' cannot be used here - its first argument is always parsed as a
++    # matcher, so both 'redir /hedgedoc' and 'redir /hedgedoc 302' misbehave.
++    handle / {
++    	header Location /hedgedoc
++    	respond 302
++    }
++
++    handle {
++    	respond 404
++    }
+diff --git a/deploy/k8s/02-secret.yaml b/deploy/k8s/02-secret.yaml
+new file mode 100644
+index 000000000..c2197a5d4
+--- /dev/null
++++ b/deploy/k8s/02-secret.yaml
+@@ -0,0 +1,17 @@
++# SPDX-FileCopyrightText: 2026 The HedgeDoc authors (see AUTHORS file)
++# SPDX-License-Identifier: AGPL-3.0-only
++#
++# WARNING: these values are for local/minikube testing only.
++# On the work cluster replace them, e.g. with Sealed-Secret / External-Secrets
++# or at least `kubectl create secret generic hedgedoc-secret --from-literal=...`.
++apiVersion: v1
++kind: Secret
++metadata:
++  name: hedgedoc-secret
++  namespace: hedgedoc
++type: Opaque
++stringData:
++  HD_DATABASE_PASSWORD: "hedgedoc"
++  # At least 32 characters!
++  HD_AUTH_SESSION_SECRET: "local-minikube-session-secret-change-me-000001"
++  POSTGRES_PASSWORD: "hedgedoc"
+diff --git a/deploy/k8s/10-postgres.yaml b/deploy/k8s/10-postgres.yaml
+new file mode 100644
+index 000000000..db351340c
+--- /dev/null
++++ b/deploy/k8s/10-postgres.yaml
+@@ -0,0 +1,87 @@
++# SPDX-FileCopyrightText: 2026 The HedgeDoc authors (see AUTHORS file)
++# SPDX-License-Identifier: AGPL-3.0-only
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: db
++  namespace: hedgedoc
++  labels:
++    app: hedgedoc-db
++spec:
++  replicas: 1
++  strategy:
++    type: Recreate
++  selector:
++    matchLabels:
++      app: hedgedoc-db
++  template:
++    metadata:
++      labels:
++        app: hedgedoc-db
++    spec:
++      containers:
++        - name: postgres
++          image: postgres:15
++          ports:
++            - containerPort: 5432
++          env:
++            - name: POSTGRES_USER
++              value: hedgedoc
++            - name: POSTGRES_DB
++              value: hedgedoc
++            - name: POSTGRES_PASSWORD
++              valueFrom:
++                secretKeyRef:
++                  name: hedgedoc-secret
++                  key: POSTGRES_PASSWORD
++          volumeMounts:
++            - name: db-data
++              mountPath: /var/lib/postgresql/data
++          # NOTE: kubernetes exec probes run the array directly - there is no
++          # shell, so docker-compose's "CMD-SHELL" form does NOT work here.
++          readinessProbe:
++            exec:
++              command: ["pg_isready", "-U", "hedgedoc", "-d", "hedgedoc"]
++            initialDelaySeconds: 5
++            periodSeconds: 5
++          livenessProbe:
++            exec:
++              command: ["pg_isready", "-U", "hedgedoc", "-d", "hedgedoc"]
++            initialDelaySeconds: 15
++            periodSeconds: 15
++          resources:
++            requests:
++              cpu: "50m"
++              memory: "128Mi"
++            limits:
++              cpu: "500m"
++              memory: "512Mi"
++      volumes:
++        - name: db-data
++          persistentVolumeClaim:
++            claimName: hedgedoc-db-data
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: db
++  namespace: hedgedoc
++spec:
++  selector:
++    app: hedgedoc-db
++  ports:
++    - port: 5432
++      targetPort: 5432
++      protocol: TCP
++---
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: hedgedoc-db-data
++  namespace: hedgedoc
++spec:
++  accessModes:
++    - ReadWriteOnce
++  resources:
++    requests:
++      storage: 1Gi
+diff --git a/deploy/k8s/20-backend.yaml b/deploy/k8s/20-backend.yaml
+new file mode 100644
+index 000000000..9448c5870
+--- /dev/null
++++ b/deploy/k8s/20-backend.yaml
+@@ -0,0 +1,96 @@
++# SPDX-FileCopyrightText: 2026 The HedgeDoc authors (see AUTHORS file)
++# SPDX-License-Identifier: AGPL-3.0-only
++#
++# The image is built with NEXT_PUBLIC_BASE_PATH only for the frontend;
++# the backend itself keeps serving root paths and relies on the proxy
++# to strip the /hedgedoc prefix.
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: backend
++  namespace: hedgedoc
++  labels:
++    app: hedgedoc-backend
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: hedgedoc-backend
++  template:
++    metadata:
++      labels:
++        app: hedgedoc-backend
++    spec:
++      initContainers:
++        - name: wait-for-db
++          image: postgres:15-alpine
++          command:
++            - sh
++            - -c
++            - "until pg_isready -h db -U hedgedoc -d hedgedoc; do echo waiting for db; sleep 2; done"
++      containers:
++        - name: backend
++          # For minikube: build & load the local image:
++          #   docker build -t hedgedoc-backend:dev -f backend/docker/Dockerfile .
++          #   minikube image load hedgedoc-backend:dev
++          # CI replaces this tag with the registry image.
++          image: hedgedoc-backend:dev
++          imagePullPolicy: IfNotPresent
++          ports:
++            - containerPort: 3000
++          envFrom:
++            - configMapRef:
++                name: hedgedoc-env
++            - secretRef:
++                name: hedgedoc-secret
++          volumeMounts:
++            - name: uploads
++              mountPath: /usr/src/app/backend/uploads
++          readinessProbe:
++            httpGet:
++              path: /api/v2/monitoring/health
++              port: 3000
++            initialDelaySeconds: 10
++            periodSeconds: 10
++          livenessProbe:
++            httpGet:
++              path: /api/v2/monitoring/health
++              port: 3000
++            initialDelaySeconds: 30
++            periodSeconds: 30
++          resources:
++            requests:
++              cpu: "100m"
++              memory: "256Mi"
++            limits:
++              cpu: "1"
++              memory: "1Gi"
++      volumes:
++        - name: uploads
++          persistentVolumeClaim:
++            claimName: hedgedoc-uploads
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: backend
++  namespace: hedgedoc
++spec:
++  selector:
++    app: hedgedoc-backend
++  ports:
++    - port: 3000
++      targetPort: 3000
++      protocol: TCP
++---
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: hedgedoc-uploads
++  namespace: hedgedoc
++spec:
++  accessModes:
++    - ReadWriteOnce
++  resources:
++    requests:
++      storage: 1Gi
+diff --git a/deploy/k8s/30-frontend.yaml b/deploy/k8s/30-frontend.yaml
+new file mode 100644
+index 000000000..5b6822419
+--- /dev/null
++++ b/deploy/k8s/30-frontend.yaml
+@@ -0,0 +1,62 @@
++# SPDX-FileCopyrightText: 2026 The HedgeDoc authors (see AUTHORS file)
++# SPDX-License-Identifier: AGPL-3.0-only
++#
++# The frontend image is built with build-arg NEXT_PUBLIC_BASE_PATH=/hedgedoc,
++# therefore Next.js expects requests to already contain the /hedgedoc prefix
++# (the proxy forwards them unchanged).
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: frontend
++  namespace: hedgedoc
++  labels:
++    app: hedgedoc-frontend
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: hedgedoc-frontend
++  template:
++    metadata:
++      labels:
++        app: hedgedoc-frontend
++    spec:
++      containers:
++        - name: frontend
++          # For minikube: build & load the local image:
++          #   docker build -t hedgedoc-frontend:dev \
++          #     --build-arg NEXT_PUBLIC_BASE_PATH=/hedgedoc \
++          #     -f frontend/docker/Dockerfile .
++          #   minikube image load hedgedoc-frontend:dev
++          image: hedgedoc-frontend:dev
++          imagePullPolicy: IfNotPresent
++          ports:
++            - containerPort: 3001
++          envFrom:
++            - configMapRef:
++                name: hedgedoc-env
++          readinessProbe:
++            tcpSocket:
++              port: 3001
++            initialDelaySeconds: 10
++            periodSeconds: 10
++          resources:
++            requests:
++              cpu: "50m"
++              memory: "128Mi"
++            limits:
++              cpu: "500m"
++              memory: "512Mi"
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: frontend
++  namespace: hedgedoc
++spec:
++  selector:
++    app: hedgedoc-frontend
++  ports:
++    - port: 3001
++      targetPort: 3001
++      protocol: TCP
+diff --git a/deploy/k8s/40-proxy.yaml b/deploy/k8s/40-proxy.yaml
+new file mode 100644
+index 000000000..0ec64af32
+--- /dev/null
++++ b/deploy/k8s/40-proxy.yaml
+@@ -0,0 +1,63 @@
++# SPDX-FileCopyrightText: 2026 The HedgeDoc authors (see AUTHORS file)
++# SPDX-License-Identifier: AGPL-3.0-only
++#
++# Caddy is the in-cluster entry point. It strips /hedgedoc for backend
++# requests and keeps it for the Next.js frontend. The ingress only routes
++# the /hedgedoc path to this service (no rewrite there).
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: proxy
++  namespace: hedgedoc
++  labels:
++    app: hedgedoc-proxy
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: hedgedoc-proxy
++  template:
++    metadata:
++      labels:
++        app: hedgedoc-proxy
++    spec:
++      containers:
++        - name: caddy
++          image: caddy:2
++          ports:
++            - containerPort: 80
++          volumeMounts:
++            - name: caddyfile
++              mountPath: /etc/caddy/Caddyfile
++              subPath: Caddyfile
++              readOnly: true
++          readinessProbe:
++            tcpSocket:
++              port: 80
++            initialDelaySeconds: 3
++            periodSeconds: 10
++          resources:
++            requests:
++              cpu: "25m"
++              memory: "32Mi"
++            limits:
++              cpu: "250m"
++              memory: "128Mi"
++      volumes:
++        - name: caddyfile
++          configMap:
++            name: hedgedoc-proxy-config
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: proxy
++  namespace: hedgedoc
++spec:
++  selector:
++    app: hedgedoc-proxy
++  ports:
++    - name: http
++      port: 80
++      targetPort: 80
++      protocol: TCP
+diff --git a/deploy/k8s/50-ingress.yaml b/deploy/k8s/50-ingress.yaml
+new file mode 100644
+index 000000000..72a5e8e2c
+--- /dev/null
++++ b/deploy/k8s/50-ingress.yaml
+@@ -0,0 +1,39 @@
++# SPDX-FileCopyrightText: 2026 The HedgeDoc authors (see AUTHORS file)
++# SPDX-License-Identifier: AGPL-3.0-only
++#
++# Requires the ingress-nginx controller:
++#   minikube addons enable ingress
++#
++# IMPORTANT: there is deliberately NO rewrite-target annotation. The whole
++# /hedgedoc path is passed to Caddy unchanged; stripping happens in Caddy
++# for the backend routes only.
++apiVersion: networking.k8s.io/v1
++kind: Ingress
++metadata:
++  name: hedgedoc
++  namespace: hedgedoc
++  annotations:
++    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
++    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
++    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
++spec:
++  ingressClassName: nginx
++  rules:
++    # No host restriction so http://localhost:20866 works during local tests.
++    # Add "- host: notes.example.com" for the work cluster if desired.
++    - http:
++        paths:
++          - path: /hedgedoc
++            pathType: Exact
++            backend:
++              service:
++                name: proxy
++                port:
++                  number: 80
++          - path: /hedgedoc/
++            pathType: Prefix
++            backend:
++              service:
++                name: proxy
++                port:
++                  number: 80
+diff --git a/docker/.env b/docker/.env
+index 89d638449..00068fb5b 100644
+--- a/docker/.env
++++ b/docker/.env
+@@ -1,5 +1,5 @@
+ # General settings
+-HD_BASE_URL="https://hedgedoc2.localhost"
++HD_BASE_URL="http://localhost:20866/hedgedoc"
+ HD_SESSION_SECRET="change_me_in_production"
+ 
+ # Database settings
+diff --git a/docker/Caddyfile b/docker/Caddyfile
+index bfc47b4ba..bb0af48a1 100644
+--- a/docker/Caddyfile
++++ b/docker/Caddyfile
+@@ -1,10 +1,29 @@
+ #
+-# SPDX-FileCopyrightText: 2023 The HedgeDoc developers (see AUTHORS file)
++# SPDX-FileCopyrightText: 2023 The HedgeDoc authors (see AUTHORS file)
+ #
+ # SPDX-License-Identifier: AGPL-3.0-only
+ #
++# HedgeDoc is served under the /hedgedoc subpath:
++#
++#   http(s)://<host>/hedgedoc/**
++#
++# - Backend routes get the prefix STRIPPED, because the backend itself keeps
++#   serving on root paths (/api/..., /media/..., /public/..., /realtime).
++# - The frontend (Next.js) is built with basePath=/hedgedoc, so the prefix
++#   is KEPT and passed to the frontend unchanged.
++
++# Trust reverse proxies in private networks (e.g. the nginx ingress in
++# Kubernetes) so Caddy preserves their X-Forwarded-* headers. The frontend
++# compares X-Forwarded-Host / X-Forwarded-Proto against HD_BASE_URL and
++# refuses to render on mismatch, which matters when TLS is terminated at the
++# ingress and traffic reaches Caddy over plain HTTP.
++{
++	servers {
++		trusted_proxies static private_ranges
++	}
++}
+ 
+-{$HD_BASE_URL}
++:80
+ 
+ log {
+ 	output stdout
+@@ -12,9 +31,33 @@ log {
+ 	format console
+ }
+ 
+-reverse_proxy /realtime http://backend:3000
+-reverse_proxy /api/* http://backend:3000
+-reverse_proxy /public/* http://backend:3000
+-reverse_proxy /uploads/* http://backend:3000
+-reverse_proxy /apidoc/* http://backend:3000
+-reverse_proxy /* http://frontend:3001
++# Backend API, media files, public files and the realtime websocket.
++# Caddy upgrades websocket connections automatically.
++# Do NOT set X-Forwarded-Host manually: the {host} placeholder omits the port,
++# which breaks non-default-port setups; Caddy's automatic header keeps the
++# full host (and preserves the ingress-provided one via trusted_proxies).
++@backend path /hedgedoc/api/* /hedgedoc/media/* /hedgedoc/public/* /hedgedoc/realtime /hedgedoc/realtime/*
++handle @backend {
++	uri strip_prefix /hedgedoc
++	reverse_proxy http://backend:3000
++}
++
++# The bare prefix and everything below it go to the Next.js frontend as-is.
++# Next.js answers /hedgedoc directly and redirects /hedgedoc/ -> /hedgedoc
++# itself; adding a redirect for the bare prefix here would cause a loop.
++@frontend path /hedgedoc /hedgedoc/*
++handle @frontend {
++	reverse_proxy http://frontend:3001
++}
++
++# Convenience: visiting the root jumps to the subpath. NOTE: 'redir' cannot
++# be used here - its first argument is always parsed as a matcher, so both
++# 'redir /hedgedoc' and 'redir /hedgedoc 302' misbehave inside a handle.
++handle / {
++	header Location /hedgedoc
++	respond 302
++}
++
++handle {
++	respond 404
++}
+diff --git a/docker/docker-compose.yml b/docker/docker-compose.yml
+index cdee53c6b..c79cfe482 100644
+--- a/docker/docker-compose.yml
++++ b/docker/docker-compose.yml
+@@ -1,38 +1,85 @@
+-# SPDX-FileCopyrightText: 2023 The HedgeDoc developers (see AUTHORS file)
++# SPDX-FileCopyrightText: 2023 The HedgeDoc authors (see AUTHORS file)
+ # SPDX-License-Identifier: AGPL-3.0-only
++#
++# Local test setup serving HedgeDoc under http://localhost:20866/hedgedoc/
++#
++#   docker compose -f docker/docker-compose.yml up -d --build
++#
++# Images are built from this repository (not pulled) so that the local
++# subpath changes take effect. The frontend build bakes in the
++# NEXT_PUBLIC_BASE_PATH build argument.
+ ---
++x-hedgedoc-base-url: &hedgedoc_base_url ${HD_BASE_URL:-http://localhost:20866/hedgedoc}
++
+ services:
+   backend:
+-    image: ghcr.io/hedgedoc/hedgedoc/backend:develop
++    build:
++      context: ..
++      dockerfile: backend/docker/Dockerfile
++    image: hedgedoc-backend:dev
++    environment:
++      # No trailing slash: the backend concatenates paths on it.
++      HD_BASE_URL: *hedgedoc_base_url
++      HD_BACKEND_BIND_IP: "0.0.0.0"
++      HD_DATABASE_TYPE: postgres
++      HD_DATABASE_HOST: db
++      HD_DATABASE_PORT: "5432"
++      HD_DATABASE_NAME: ${HD_DATABASE_NAME:-hedgedoc}
++      HD_DATABASE_USERNAME: ${HD_DATABASE_USERNAME:-hedgedoc}
++      HD_DATABASE_PASSWORD: ${HD_DATABASE_PASSWORD:-hedgedoc}
++      HD_AUTH_SESSION_SECRET: ${HD_AUTH_SESSION_SECRET:-local-development-session-secret-change-me-0001}
++      HD_AUTH_LOCAL_ENABLE_LOGIN: "true"
++      HD_AUTH_LOCAL_ENABLE_REGISTER: "true"
++      HD_NOTE_PERMISSIONS_MAX_GUEST_LEVEL: write
++      HD_MEDIA_BACKEND_TYPE: filesystem
++      HD_MEDIA_BACKEND_FILESYSTEM_UPLOAD_PATH: uploads/
+     volumes:
+-      - ./.env:/usr/src/app/backend/.env
+       - hedgedoc_uploads:/usr/src/app/backend/uploads
++    depends_on:
++      db:
++        condition: service_healthy
+ 
+   frontend:
+-    image: ghcr.io/hedgedoc/hedgedoc/frontend:develop
++    build:
++      context: ..
++      dockerfile: frontend/docker/Dockerfile
++      args:
++        # Baked into the Next.js build; change together with the prefix in Caddyfile.
++        NEXT_PUBLIC_BASE_PATH: ${NEXT_PUBLIC_BASE_PATH:-/hedgedoc}
++    image: hedgedoc-frontend:dev
+     environment:
+-      HD_BASE_URL: "${HD_BASE_URL}"
++      HD_BASE_URL: *hedgedoc_base_url
++      # Server-side rendering calls the backend directly inside the network.
++      HD_INTERNAL_API_URL: http://backend:3000/
+ 
+   db:
+     image: postgres:15
+     environment:
+-      POSTGRES_USER: "${HD_DATABASE_USERNAME}"
+-      POSTGRES_PASSWORD: "${HD_DATABASE_PASSWORD}"
+-      POSTGRES_DB: "${HD_DATABASE_NAME}"
++      POSTGRES_USER: ${HD_DATABASE_USERNAME:-hedgedoc}
++      POSTGRES_PASSWORD: ${HD_DATABASE_PASSWORD:-hedgedoc}
++      POSTGRES_DB: ${HD_DATABASE_NAME:-hedgedoc}
++    volumes:
++      - hedgedoc_db_data:/var/lib/postgresql/data
++    healthcheck:
++      test: ["CMD-SHELL", "pg_isready -U ${HD_DATABASE_USERNAME:-hedgedoc} -d ${HD_DATABASE_NAME:-hedgedoc}"]
++      interval: 5s
++      timeout: 5s
++      retries: 20
+ 
+   proxy:
+-    image: caddy:latest
++    image: caddy:2
+     restart: unless-stopped
+-    environment:
+-      HD_BASE_URL: "${HD_BASE_URL}"
+     ports:
+-      - "80:80"
+-      - "443:443"
+-      - "443:443/udp"
++      # Open http://localhost:20866/hedgedoc/
++      - "20866:80"
+     volumes:
+-      - ./Caddyfile:/etc/caddy/Caddyfile
++      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+       - caddy_data:/data
++    depends_on:
++      - backend
++      - frontend
+ 
+ volumes:
+   hedgedoc_uploads:
++  hedgedoc_db_data:
+   caddy_data:
+diff --git a/frontend/docker/Dockerfile b/frontend/docker/Dockerfile
+index 9a033b62f..7ca0f4566 100644
+--- a/frontend/docker/Dockerfile
++++ b/frontend/docker/Dockerfile
+@@ -18,11 +18,23 @@ RUN apk add --no-cache libc6-compat git
+ ENV NODE_ENV=production
+ ENV NEXT_TELEMETRY_DISABLED=1
+ 
++# The subpath under which HedgeDoc will be served (e.g. /hedgedoc).
++# basePath is baked into the Next.js build, so it must be set here.
++# Leave it empty to serve the app at the domain root.
++ARG NEXT_PUBLIC_BASE_PATH=/hedgedoc
++ENV NEXT_PUBLIC_BASE_PATH=${NEXT_PUBLIC_BASE_PATH}
++
+ ENV PNPM_STORE_DIR=/tmp/.pnpm-store
+ USER node
+ WORKDIR /usr/src/app
+ 
+ COPY --chown=node . .
++
++# Windows checkouts (core.autocrlf=true) carry CRLF line endings, which break
++# shell scripts inside the container ("sh: ./build.sh: not found").
++# Normalize all shell scripts to LF before any build step executes them.
++RUN find . -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
++
+ RUN --mount=type=cache,sharing=locked,uid=1000,gid=1000,target=/tmp/.pnpm-store \
+     pnpm install --frozen-lockfile --store-dir "$PNPM_STORE_DIR"
+ 
+@@ -33,6 +45,10 @@ FROM base
+ ENV NODE_ENV=production
+ ENV NEXT_TELEMETRY_DISABLED=1
+ 
++# Keep the build-time base path also available at runtime (server components).
++ARG NEXT_PUBLIC_BASE_PATH=/hedgedoc
++ENV NEXT_PUBLIC_BASE_PATH=${NEXT_PUBLIC_BASE_PATH}
++
+ LABEL org.opencontainers.image.title='HedgeDoc production frontend image'
+ LABEL org.opencontainers.image.url='https://hedgedoc.org'
+ LABEL org.opencontainers.image.source='https://github.com/hedgedoc/hedgedoc'
+diff --git a/frontend/next.config.js b/frontend/next.config.js
+index bea576648..80c4a9d8b 100644
+--- a/frontend/next.config.js
++++ b/frontend/next.config.js
+@@ -12,6 +12,15 @@ const withBundleAnalyzer = require('@next/bundle-analyzer')({
+ 
+ console.log('Node environment is', process.env.NODE_ENV)
+ 
++// Serve the whole frontend under a subpath (e.g. /hedgedoc) so it can be
++// exposed through an ingress that shares the host with other applications.
++// NEXT_PUBLIC_BASE_PATH is read at BUILD time (see frontend/docker/Dockerfile).
++// An empty value (default) keeps the app served at the root.
++const basePath = process.env.NEXT_PUBLIC_BASE_PATH || ''
++if (basePath) {
++  console.log(`Serving frontend under basePath '${basePath}'`)
++}
++
+ if (isTestMode) {
+   console.warn(`This build runs in test mode. This means:
+  - No sandboxed iframe
+@@ -58,6 +67,7 @@ const svgrConfig = {
+ 
+ /** @type {import('next').NextConfig} */
+ const rawNextConfig = {
++  basePath,
+   webpack: (config) => {
+     config.module.rules.push({
+       test: /\.svg$/i,
+diff --git a/frontend/public/icons/site.webmanifest b/frontend/public/icons/site.webmanifest
+index adbd7a984..ee47c96d1 100644
+--- a/frontend/public/icons/site.webmanifest
++++ b/frontend/public/icons/site.webmanifest
+@@ -3,12 +3,12 @@
+     "short_name": "HedgeDoc",
+     "icons": [
+         {
+-            "src": "/icons/android-chrome-192x192.png",
++            "src": "android-chrome-192x192.png",
+             "sizes": "192x192",
+             "type": "image/png"
+         },
+         {
+-            "src": "/icons/android-chrome-512x512.png",
++            "src": "android-chrome-512x512.png",
+             "sizes": "512x512",
+             "type": "image/png"
+         }
+diff --git a/frontend/src/api/common/api-request-builder/api-request-builder.ts b/frontend/src/api/common/api-request-builder/api-request-builder.ts
+index 21100ad10..3389b7d96 100644
+--- a/frontend/src/api/common/api-request-builder/api-request-builder.ts
++++ b/frontend/src/api/common/api-request-builder/api-request-builder.ts
+@@ -48,7 +48,10 @@ export abstract class ApiRequestBuilder<ResponseType> {
+       }
+       return actualBaseUrl
+     } else {
+-      return baseUrl ?? '/'
++      // In the browser all requests are same-origin. Prefix the configured
++      // subpath so calls work when HedgeDoc is served under a base path.
++      const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? ''
++      return baseUrl ?? `${basePath}/`
+     }
+   }
+ 
+diff --git a/frontend/src/app/(editor)/layout.tsx b/frontend/src/app/(editor)/layout.tsx
+index 5540470f4..fe7e9255d 100644
+--- a/frontend/src/app/(editor)/layout.tsx
++++ b/frontend/src/app/(editor)/layout.tsx
+@@ -23,6 +23,8 @@ import { CachedMotdModal } from '../../components/global-dialogs/motd-modal/cach
+ 
+ configureLuxon()
+ 
++const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? ''
++
+ interface RootLayoutProps extends PropsWithChildren {
+   appBar: React.ReactNode
+ }
+@@ -35,7 +37,7 @@ export default async function RootLayout({ children, appBar }: RootLayoutProps)
+   return (
+     <html lang='en'>
+       <head>
+-        <link color='#b51f08' href='/icons/safari-pinned-tab.svg' rel='mask-icon' />
++        <link color='#b51f08' href={`${basePath}/icons/safari-pinned-tab.svg`} rel='mask-icon' />
+       </head>
+       <body>
+         <ExpectedOriginBoundary expectedOrigin={baseUrls.editor}>
+@@ -70,7 +72,7 @@ export const metadata: Metadata = {
+   },
+   description: 'HedgeDoc - Ideas grow better together',
+   title: 'HedgeDoc',
+-  manifest: '/icons/site.webmanifest'
++  manifest: `${basePath}/icons/site.webmanifest`
+ }
+ 
+ export const viewport: Viewport = {
+diff --git a/frontend/src/components/cheatsheet/cheatsheet-in-new-tab-button.tsx b/frontend/src/components/cheatsheet/cheatsheet-in-new-tab-button.tsx
+index adf64010e..41d1079a8 100644
+--- a/frontend/src/components/cheatsheet/cheatsheet-in-new-tab-button.tsx
++++ b/frontend/src/components/cheatsheet/cheatsheet-in-new-tab-button.tsx
+@@ -18,13 +18,18 @@ export interface CheatsheetInNewTabButtonProps {
+  * Renders a button that opens the cheatsheet in a new tab.
+  */
+ export const CheatsheetInNewTabButton: React.FC<CheatsheetInNewTabButtonProps> = ({ onClick }) => {
++  const cheatsheetPath = `${process.env.NEXT_PUBLIC_BASE_PATH ?? ''}/cheatsheet`
+   const openPopUp = useCallback(
+     (event: MouseEvent<HTMLButtonElement>) => {
+       event.preventDefault()
+-      window.open('/cheatsheet', '_blank', 'menubar=no,width=1000,height=600,location=no,toolbar=no')
++      window.open(
++        cheatsheetPath,
++        '_blank',
++        'menubar=no,width=1000,height=600,location=no,toolbar=no'
++      )
+       onClick?.()
+     },
+-    [onClick]
++    [cheatsheetPath, onClick]
+   )
+   const buttonVariant = useOutlineButtonVariant()
+   const buttonTitle = useTranslatedText('cheatsheet.modal.popup')
+@@ -33,7 +38,7 @@ export const CheatsheetInNewTabButton: React.FC<CheatsheetInNewTabButtonProps> =
+     <IconButton
+       size={'sm'}
+       iconSize={1.2}
+-      href={'/cheatsheet'}
++      href={cheatsheetPath}
+       onClick={openPopUp}
+       icon={BoxArrowUpRight}
+       className={'p-2 border-0'}
+diff --git a/frontend/src/components/editor-page/editor-pane/tool-bar/emoji-picker/emoji-picker-popover.tsx b/frontend/src/components/editor-page/editor-pane/tool-bar/emoji-picker/emoji-picker-popover.tsx
+index fb21eef89..e4d88c9d0 100644
+--- a/frontend/src/components/editor-page/editor-pane/tool-bar/emoji-picker/emoji-picker-popover.tsx
++++ b/frontend/src/components/editor-page/editor-pane/tool-bar/emoji-picker/emoji-picker-popover.tsx
+@@ -12,7 +12,8 @@ import React, { useEffect, useRef } from 'react'
+ import { Popover } from 'react-bootstrap'
+ import type { PopoverProps } from 'react-bootstrap/Popover'
+ 
+-const EMOJI_DATA_PATH = '/_next/static/js/emoji-data.json'
++const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? ''
++const EMOJI_DATA_PATH = `${basePath}/_next/static/js/emoji-data.json`
+ 
+ const emojiPickerConfig: PickerConstructorOptions = {
+   dataSource: EMOJI_DATA_PATH
+diff --git a/frontend/src/components/intro-page/requests.ts b/frontend/src/components/intro-page/requests.ts
+index 50b34e345..eac2c4a57 100644
+--- a/frontend/src/components/intro-page/requests.ts
++++ b/frontend/src/components/intro-page/requests.ts
+@@ -12,7 +12,8 @@ import { defaultConfig } from '../../api/common/default-config'
+  * @throws {Error} if the content can't be fetched
+  */
+ export const fetchFrontPageContent = async (): Promise<string> => {
+-  const response = await fetch('/public/intro.md', {
++  const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? ''
++  const response = await fetch(`${basePath}/public/intro.md`, {
+     ...defaultConfig,
+     method: 'GET'
+   })
+diff --git a/frontend/src/redux/csrf-token/methods.ts b/frontend/src/redux/csrf-token/methods.ts
+index b4eab2b4f..2a61d141f 100644
+--- a/frontend/src/redux/csrf-token/methods.ts
++++ b/frontend/src/redux/csrf-token/methods.ts
+@@ -40,7 +40,8 @@ export async function refreshCsrfToken(): Promise<void> {
+   if (typeof window === 'undefined') {
+     return
+   }
+-  const response = await fetch('/api/private/csrf/token', {
++  const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? ''
++  const response = await fetch(`${basePath}/api/private/csrf/token`, {
+     method: 'GET',
+     credentials: 'same-origin'
+   })
+diff --git a/frontend/src/utils/base-url-from-env-extractor.spec.ts b/frontend/src/utils/base-url-from-env-extractor.spec.ts
+index 50c85bcfa..45d64f824 100644
+--- a/frontend/src/utils/base-url-from-env-extractor.spec.ts
++++ b/frontend/src/utils/base-url-from-env-extractor.spec.ts
+@@ -56,31 +56,57 @@ describe('BaseUrlFromEnvExtractor', () => {
+     expect(() => sut.extractBaseUrls()).toThrow("isn't a valid URL")
+   })
+ 
+-  it('should throw if editor base url contains a subdirectory', () => {
+-    process.env.HD_BASE_URL = 'https://editor.example.org/asd/'
++  it('should accept a single subpath in editor base url', () => {
++    process.env.HD_BASE_URL = 'https://editor.example.org/hedgedoc'
+     process.env.HD_RENDERER_BASE_URL = 'https://renderer.example.org/'
+     process.env.HD_INTERNAL_API_URL = 'https://internal.example.org/'
+     const sut = new BaseUrlFromEnvExtractor()
+ 
+-    expect(() => sut.extractBaseUrls()).toThrow('Subdirectories are not allowed')
++    expect(sut.extractBaseUrls()).toStrictEqual({
++      renderer: 'https://renderer.example.org/',
++      internalApiUrl: 'https://internal.example.org/',
++      editor: 'https://editor.example.org/hedgedoc/'
++    })
++  })
++
++  it('appends a trailing slash to a single subpath so downstream path joins work', () => {
++    process.env.HD_BASE_URL = 'https://editor.example.org/hedgedoc/'
++    delete process.env.HD_RENDERER_BASE_URL
++    delete process.env.HD_INTERNAL_API_URL
++    const sut = new BaseUrlFromEnvExtractor()
++
++    expect(sut.extractBaseUrls()).toStrictEqual({
++      renderer: 'https://editor.example.org/hedgedoc/',
++      internalApiUrl: undefined,
++      editor: 'https://editor.example.org/hedgedoc/'
++    })
++  })
++
++  it('should throw if editor base url contains more than one subdirectory', () => {
++    process.env.HD_BASE_URL = 'https://editor.example.org/asd/foo'
++    process.env.HD_RENDERER_BASE_URL = 'https://renderer.example.org/'
++    process.env.HD_INTERNAL_API_URL = 'https://internal.example.org/'
++    const sut = new BaseUrlFromEnvExtractor()
++
++    expect(() => sut.extractBaseUrls()).toThrow('More than one subdirectory is not allowed')
+   })
+ 
+   it('should throw if renderer base url contains a subdirectory', () => {
+     process.env.HD_BASE_URL = 'https://editor.example.org/'
+-    process.env.HD_RENDERER_BASE_URL = 'https://renderer.example.org/asd/'
++    process.env.HD_RENDERER_BASE_URL = 'https://renderer.example.org/asd/foo'
+     process.env.HD_INTERNAL_API_URL = 'https://internal.example.org/'
+     const sut = new BaseUrlFromEnvExtractor()
+ 
+-    expect(() => sut.extractBaseUrls()).toThrow('Subdirectories are not allowed')
++    expect(() => sut.extractBaseUrls()).toThrow('More than one subdirectory is not allowed')
+   })
+ 
+   it('should throw if internal api url contains a subdirectory', () => {
+     process.env.HD_BASE_URL = 'https://editor.example.org/'
+     process.env.HD_RENDERER_BASE_URL = 'https://renderer.example.org/'
+-    process.env.HD_INTERNAL_API_URL = 'https://internal.example.org/asd/'
++    process.env.HD_INTERNAL_API_URL = 'https://internal.example.org/asd/foo'
+     const sut = new BaseUrlFromEnvExtractor()
+ 
+-    expect(() => sut.extractBaseUrls()).toThrow('Subdirectories are not allowed')
++    expect(() => sut.extractBaseUrls()).toThrow('More than one subdirectory is not allowed')
+   })
+ 
+   it('should copy editor base url to renderer base url if url is omitted', () => {
+diff --git a/frontend/src/utils/base-url-from-env-extractor.ts b/frontend/src/utils/base-url-from-env-extractor.ts
+index 0aaf5a36b..a8af8cfbd 100644
+--- a/frontend/src/utils/base-url-from-env-extractor.ts
++++ b/frontend/src/utils/base-url-from-env-extractor.ts
+@@ -34,11 +34,30 @@ export class BaseUrlFromEnvExtractor {
+     return this.extractUrlFromEnvVar(process.env[envVarName])
+   }
+ 
++  /**
++   * Ensures the URL path ends with a slash. Many call sites append paths
++   * directly (`${baseUrl}public/motd.md`, `pathname += 'realtime'`) or resolve
++   * relative URLs against the base. Those only work when the path has a
++   * trailing slash; with a subpath and no trailing slash they produce
++   * "/hedgedocrealtime" or drop the subpath segment entirely.
++   */
++  private withTrailingSlash(url: URL): URL {
++    if (!url.pathname.endsWith('/')) {
++      url.pathname += '/'
++    }
++    return url
++  }
++
+   private renewBaseUrls(): BaseUrls {
+     return this.extractUrlFromEnvVar(process.env.HD_BASE_URL)
+-      .map((editorBaseUrl) => {
+-        const rendererBaseUrl = this.extractUrlFromEnv('HD_RENDERER_BASE_URL').orElse(editorBaseUrl)
+-        const internalApiUrl = this.extractUrlFromEnv('HD_INTERNAL_API_URL').orElse(undefined)
++      .map((rawEditorBaseUrl) => {
++        const editorBaseUrl = this.withTrailingSlash(rawEditorBaseUrl)
++        const rendererBaseUrl = this.withTrailingSlash(
++          this.extractUrlFromEnv('HD_RENDERER_BASE_URL').orElse(editorBaseUrl),
++        )
++        const internalApiUrl = this.extractUrlFromEnv('HD_INTERNAL_API_URL')
++          .map((url) => this.withTrailingSlash(url))
++          .orElse(undefined)
+         return {
+           editor: editorBaseUrl.toString(),
+           renderer: rendererBaseUrl.toString(),
